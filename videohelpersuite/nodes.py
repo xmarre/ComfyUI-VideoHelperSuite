@@ -13,6 +13,7 @@ from pathlib import Path
 from string import Template
 import itertools
 import functools
+import tempfile
 
 import folder_paths
 from .logger import logger
@@ -129,6 +130,18 @@ def tensor_to_shorts(tensor):
 def tensor_to_bytes(tensor):
     return tensor_to_int(tensor, 8).astype(np.uint8)
 
+def _read_stderr_file(stderr_file):
+    stderr_file.flush()
+    stderr_file.seek(0)
+    return stderr_file.read()
+
+def _close_proc_stdin(proc):
+    try:
+        if proc.stdin is not None and not proc.stdin.closed:
+            proc.stdin.close()
+    except BrokenPipeError:
+        pass
+
 def ffmpeg_process(args, video_format, video_metadata, file_path, env):
 
     res = None
@@ -158,43 +171,51 @@ def ffmpeg_process(args, video_format, video_metadata, file_path, env):
                     f.write(escape_ffmpeg_metadata(k, json.dumps(v)) + "\n")
 
         m_args = args[:1] + ["-i", metadata_path] + args[1:] + ["-metadata", "creation_time=now", "-movflags", "use_metadata_tags"]
-        with subprocess.Popen(m_args + [file_path], stderr=subprocess.PIPE,
-                              stdin=subprocess.PIPE, env=env) as proc:
-            try:
-                while frame_data is not None:
-                    proc.stdin.write(frame_data)
-                    #TODO: skip flush for increased speed
-                    frame_data = yield
-                    total_frames_output+=1
-                proc.stdin.flush()
-                proc.stdin.close()
-                res = proc.stderr.read()
-            except BrokenPipeError as e:
-                err = proc.stderr.read()
-                #Check if output file exists. If it does, the re-execution
-                #will also fail. This obscures the cause of the error
-                #and seems to never occur concurrent to the metadata issue
-                if os.path.exists(file_path):
-                    raise Exception("An error occurred in the ffmpeg subprocess:\n" \
-                            + err.decode(*ENCODE_ARGS))
-                #Res was not set
-                print(err.decode(*ENCODE_ARGS), end="", file=sys.stderr)
-                logger.warn("An error occurred when saving with metadata")
+        with tempfile.TemporaryFile() as stderr_file:
+            with subprocess.Popen(m_args + [file_path], stderr=stderr_file,
+                                  stdin=subprocess.PIPE, env=env) as proc:
+                try:
+                    while frame_data is not None:
+                        proc.stdin.write(frame_data)
+                        #TODO: skip flush for increased speed
+                        frame_data = yield
+                        total_frames_output+=1
+                    proc.stdin.flush()
+                    _close_proc_stdin(proc)
+                    proc.wait()
+                    res = _read_stderr_file(stderr_file)
+                except BrokenPipeError as e:
+                    _close_proc_stdin(proc)
+                    proc.wait()
+                    err = _read_stderr_file(stderr_file)
+                    #Check if output file exists. If it does, the re-execution
+                    #will also fail. This obscures the cause of the error
+                    #and seems to never occur concurrent to the metadata issue
+                    if os.path.exists(file_path):
+                        raise Exception("An error occurred in the ffmpeg subprocess:\n" \
+                                + err.decode(*ENCODE_ARGS))
+                    #Res was not set
+                    print(err.decode(*ENCODE_ARGS), end="", file=sys.stderr)
+                    logger.warn("An error occurred when saving with metadata")
     if res != b'':
-        with subprocess.Popen(args + [file_path], stderr=subprocess.PIPE,
-                              stdin=subprocess.PIPE, env=env) as proc:
-            try:
-                while frame_data is not None:
-                    proc.stdin.write(frame_data)
-                    frame_data = yield
-                    total_frames_output+=1
-                proc.stdin.flush()
-                proc.stdin.close()
-                res = proc.stderr.read()
-            except BrokenPipeError as e:
-                res = proc.stderr.read()
-                raise Exception("An error occurred in the ffmpeg subprocess:\n" \
-                        + res.decode(*ENCODE_ARGS))
+        with tempfile.TemporaryFile() as stderr_file:
+            with subprocess.Popen(args + [file_path], stderr=stderr_file,
+                                  stdin=subprocess.PIPE, env=env) as proc:
+                try:
+                    while frame_data is not None:
+                        proc.stdin.write(frame_data)
+                        frame_data = yield
+                        total_frames_output+=1
+                    proc.stdin.flush()
+                    _close_proc_stdin(proc)
+                    proc.wait()
+                    res = _read_stderr_file(stderr_file)
+                except BrokenPipeError as e:
+                    _close_proc_stdin(proc)
+                    proc.wait()
+                    res = _read_stderr_file(stderr_file)
+                    raise Exception("An error occurred in the ffmpeg subprocess:\n" \
+                            + res.decode(*ENCODE_ARGS))
     yield total_frames_output
     if len(res) > 0:
         print(res.decode(*ENCODE_ARGS), end="", file=sys.stderr)
