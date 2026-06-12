@@ -144,6 +144,7 @@ def _close_proc_stdin(proc):
         pass
 
 def _ffmpeg_finalize_timeout():
+    """Return the configured ffmpeg finalization timeout in seconds."""
     try:
         timeout = float(os.environ.get("VHS_FFMPEG_FINALIZE_TIMEOUT", "0") or 0)
     except ValueError:
@@ -155,13 +156,14 @@ def _ffmpeg_finalize_timeout():
     return timeout
 
 def _wait_ffmpeg(proc, stderr_file, context):
+    """Wait for ffmpeg finalization and terminate it when the limit expires."""
     timeout = _ffmpeg_finalize_timeout()
     try:
         if timeout > 0:
             proc.wait(timeout=timeout)
         else:
             proc.wait()
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as e:
         _close_proc_stdin(proc)
         proc.kill()
         proc.wait()
@@ -170,7 +172,7 @@ def _wait_ffmpeg(proc, stderr_file, context):
             f"ffmpeg was killed after failing to exit within the configured "
             f"{timeout:g}s finalization timeout while {context}.\n"
             + err
-        )
+        ) from e
 
 def ffmpeg_process(args, video_format, video_metadata, file_path, env):
 
@@ -655,24 +657,23 @@ class VideoCombine:
                 audio_data = audio['waveform'].squeeze(0).transpose(0,1) \
                         .numpy().tobytes()
                 merge_filter_args(mux_args, '-af')
-                finalize_timeout = _ffmpeg_finalize_timeout()
-                try:
-                    res = subprocess.run(mux_args, input=audio_data,
-                                         env=env, stdout=subprocess.DEVNULL,
-                                         stderr=subprocess.PIPE, check=True,
-                                         timeout=finalize_timeout or None)
-                except subprocess.TimeoutExpired as e:
-                    err = (e.stderr or b'').decode(*ENCODE_ARGS)
-                    raise TimeoutError(
-                        "ffmpeg was killed after failing to exit within the configured "
-                        f"{finalize_timeout:g}s finalization timeout while muxing audio.\n"
-                        + err
-                    )
-                except subprocess.CalledProcessError as e:
-                    raise Exception("An error occured in the ffmpeg subprocess:\n" \
-                            + e.stderr.decode(*ENCODE_ARGS))
-                if res.stderr:
-                    print(res.stderr.decode(*ENCODE_ARGS), end="", file=sys.stderr)
+                with tempfile.TemporaryFile() as stderr_file:
+                    with subprocess.Popen(mux_args, stdin=subprocess.PIPE,
+                                          stdout=subprocess.DEVNULL, stderr=stderr_file,
+                                          env=env) as proc:
+                        try:
+                            proc.stdin.write(audio_data)
+                            proc.stdin.flush()
+                        except BrokenPipeError:
+                            pass
+                        _close_proc_stdin(proc)
+                        _wait_ffmpeg(proc, stderr_file, "muxing audio")
+                        err = _read_stderr_file(stderr_file)
+                    if proc.returncode != 0:
+                        raise Exception("An error occurred in the ffmpeg subprocess:\n" \
+                                + err.decode(*ENCODE_ARGS))
+                if err:
+                    print(err.decode(*ENCODE_ARGS), end="", file=sys.stderr)
                 output_files.append(output_file_with_audio_path)
                 #Return this file with audio to the webui.
                 #It will be muted unless opened or saved with right click
