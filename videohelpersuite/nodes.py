@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import math
 import subprocess
 import numpy as np
 import re
@@ -131,16 +132,50 @@ def tensor_to_bytes(tensor):
     return tensor_to_int(tensor, 8).astype(np.uint8)
 
 def _read_stderr_file(stderr_file):
+    """Read all captured ffmpeg stderr without closing its temporary file."""
     stderr_file.flush()
     stderr_file.seek(0)
     return stderr_file.read()
 
 def _close_proc_stdin(proc):
+    """Close a child process stdin pipe while tolerating an early ffmpeg exit."""
     try:
         if proc.stdin is not None and not proc.stdin.closed:
             proc.stdin.close()
     except BrokenPipeError:
         pass
+
+def _ffmpeg_finalize_timeout():
+    """Return the configured ffmpeg finalization timeout in seconds."""
+    try:
+        timeout = float(os.environ.get("VHS_FFMPEG_FINALIZE_TIMEOUT", "0") or 0)
+    except ValueError:
+        logger.warn("Invalid VHS_FFMPEG_FINALIZE_TIMEOUT value; timeout disabled")
+        return 0
+    if not math.isfinite(timeout) or timeout < 0:
+        logger.warn("VHS_FFMPEG_FINALIZE_TIMEOUT must be a finite, non-negative number; timeout disabled")
+        return 0
+    return timeout
+
+def _wait_ffmpeg(proc, stderr_file, context):
+    """Wait for ffmpeg finalization, returning its exit code or timing out."""
+    timeout = _ffmpeg_finalize_timeout()
+    try:
+        if timeout > 0:
+            proc.wait(timeout=timeout)
+        else:
+            proc.wait()
+    except subprocess.TimeoutExpired as e:
+        _close_proc_stdin(proc)
+        proc.kill()
+        proc.wait()
+        err = _read_stderr_file(stderr_file).decode(*ENCODE_ARGS)
+        raise TimeoutError(
+            f"ffmpeg was killed after failing to exit within the configured "
+            f"{timeout:g}s finalization timeout while {context}.\n"
+            + err
+        ) from e
+    return proc.returncode
 
 def ffmpeg_process(args, video_format, video_metadata, file_path, env):
 
@@ -173,7 +208,8 @@ def ffmpeg_process(args, video_format, video_metadata, file_path, env):
         m_args = args[:1] + ["-i", metadata_path] + args[1:] + ["-metadata", "creation_time=now", "-movflags", "use_metadata_tags"]
         with tempfile.TemporaryFile() as stderr_file:
             with subprocess.Popen(m_args + [file_path], stderr=stderr_file,
-                                  stdin=subprocess.PIPE, env=env) as proc:
+                                  stdout=subprocess.DEVNULL, stdin=subprocess.PIPE,
+                                  env=env) as proc:
                 try:
                     while frame_data is not None:
                         proc.stdin.write(frame_data)
@@ -182,11 +218,13 @@ def ffmpeg_process(args, video_format, video_metadata, file_path, env):
                         total_frames_output+=1
                     proc.stdin.flush()
                     _close_proc_stdin(proc)
-                    proc.wait()
+                    returncode = _wait_ffmpeg(proc, stderr_file, "saving video with metadata")
                     res = _read_stderr_file(stderr_file)
+                    if returncode != 0 and res == b'':
+                        res = f"ffmpeg exited with status {returncode}\n".encode()
                 except BrokenPipeError as e:
                     _close_proc_stdin(proc)
-                    proc.wait()
+                    _wait_ffmpeg(proc, stderr_file, "handling a broken ffmpeg metadata pipe")
                     err = _read_stderr_file(stderr_file)
                     #Check if output file exists. If it does, the re-execution
                     #will also fail. This obscures the cause of the error
@@ -200,7 +238,8 @@ def ffmpeg_process(args, video_format, video_metadata, file_path, env):
     if res != b'':
         with tempfile.TemporaryFile() as stderr_file:
             with subprocess.Popen(args + [file_path], stderr=stderr_file,
-                                  stdin=subprocess.PIPE, env=env) as proc:
+                                  stdout=subprocess.DEVNULL, stdin=subprocess.PIPE,
+                                  env=env) as proc:
                 try:
                     while frame_data is not None:
                         proc.stdin.write(frame_data)
@@ -208,11 +247,14 @@ def ffmpeg_process(args, video_format, video_metadata, file_path, env):
                         total_frames_output+=1
                     proc.stdin.flush()
                     _close_proc_stdin(proc)
-                    proc.wait()
+                    returncode = _wait_ffmpeg(proc, stderr_file, "saving video")
                     res = _read_stderr_file(stderr_file)
+                    if returncode != 0:
+                        raise Exception(f"ffmpeg exited with status {returncode}:\n" \
+                                + res.decode(*ENCODE_ARGS))
                 except BrokenPipeError as e:
                     _close_proc_stdin(proc)
-                    proc.wait()
+                    _wait_ffmpeg(proc, stderr_file, "handling a broken ffmpeg pipe")
                     res = _read_stderr_file(stderr_file)
                     raise Exception("An error occurred in the ffmpeg subprocess:\n" \
                             + res.decode(*ENCODE_ARGS))
@@ -509,7 +551,7 @@ class VideoCombine:
             bitrate = video_format.get('bitrate')
             if bitrate is not None:
                 bitrate_arg = ["-b:v", str(bitrate) + "M" if video_format.get('megabit') == 'True' else str(bitrate) + "K"]
-            args = [ffmpeg_path, "-v", "error", "-f", "rawvideo", "-pix_fmt", i_pix_fmt,
+            args = [ffmpeg_path, "-nostdin", "-v", "error", "-f", "rawvideo", "-pix_fmt", i_pix_fmt,
                     # The image data is in an undefined generic RGB color space, which in practice means sRGB.
                     # sRGB has the same primaries and matrix as BT.709, but a different transfer function (gamma),
                     # called by the sRGB standard name IEC 61966-2-1. However, video hosting platforms like YouTube
@@ -614,7 +656,7 @@ class VideoCombine:
                     apad = []
                 else:
                     apad = ["-af", "apad=whole_dur="+str(min_audio_dur)]
-                mux_args = [ffmpeg_path, "-v", "error", "-n", "-i", file_path,
+                mux_args = [ffmpeg_path, "-nostdin", "-v", "error", "-n", "-i", file_path,
                             "-ar", str(audio['sample_rate']), "-ac", str(channels),
                             "-f", "f32le", "-i", "-", "-c:v", "copy"] \
                             + video_format["audio_pass"] \
@@ -623,14 +665,23 @@ class VideoCombine:
                 audio_data = audio['waveform'].squeeze(0).transpose(0,1) \
                         .numpy().tobytes()
                 merge_filter_args(mux_args, '-af')
-                try:
-                    res = subprocess.run(mux_args, input=audio_data,
-                                         env=env, capture_output=True, check=True)
-                except subprocess.CalledProcessError as e:
-                    raise Exception("An error occured in the ffmpeg subprocess:\n" \
-                            + e.stderr.decode(*ENCODE_ARGS))
-                if res.stderr:
-                    print(res.stderr.decode(*ENCODE_ARGS), end="", file=sys.stderr)
+                with tempfile.TemporaryFile() as stderr_file:
+                    with subprocess.Popen(mux_args, stdin=subprocess.PIPE,
+                                          stdout=subprocess.DEVNULL, stderr=stderr_file,
+                                          env=env) as proc:
+                        try:
+                            proc.stdin.write(audio_data)
+                            proc.stdin.flush()
+                        except BrokenPipeError:
+                            pass
+                        _close_proc_stdin(proc)
+                        returncode = _wait_ffmpeg(proc, stderr_file, "muxing audio")
+                        err = _read_stderr_file(stderr_file)
+                    if returncode != 0:
+                        raise Exception(f"ffmpeg exited with status {returncode}:\n" \
+                                + err.decode(*ENCODE_ARGS))
+                if err:
+                    print(err.decode(*ENCODE_ARGS), end="", file=sys.stderr)
                 output_files.append(output_file_with_audio_path)
                 #Return this file with audio to the webui.
                 #It will be muted unless opened or saved with right click
