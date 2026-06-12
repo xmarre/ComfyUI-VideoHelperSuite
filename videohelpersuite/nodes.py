@@ -132,11 +132,13 @@ def tensor_to_bytes(tensor):
     return tensor_to_int(tensor, 8).astype(np.uint8)
 
 def _read_stderr_file(stderr_file):
+    """Read all captured ffmpeg stderr without closing its temporary file."""
     stderr_file.flush()
     stderr_file.seek(0)
     return stderr_file.read()
 
 def _close_proc_stdin(proc):
+    """Close a child process stdin pipe while tolerating an early ffmpeg exit."""
     try:
         if proc.stdin is not None and not proc.stdin.closed:
             proc.stdin.close()
@@ -156,7 +158,7 @@ def _ffmpeg_finalize_timeout():
     return timeout
 
 def _wait_ffmpeg(proc, stderr_file, context):
-    """Wait for ffmpeg finalization and terminate it when the limit expires."""
+    """Wait for ffmpeg finalization, returning its exit code or timing out."""
     timeout = _ffmpeg_finalize_timeout()
     try:
         if timeout > 0:
@@ -173,6 +175,7 @@ def _wait_ffmpeg(proc, stderr_file, context):
             f"{timeout:g}s finalization timeout while {context}.\n"
             + err
         ) from e
+    return proc.returncode
 
 def ffmpeg_process(args, video_format, video_metadata, file_path, env):
 
@@ -215,8 +218,10 @@ def ffmpeg_process(args, video_format, video_metadata, file_path, env):
                         total_frames_output+=1
                     proc.stdin.flush()
                     _close_proc_stdin(proc)
-                    _wait_ffmpeg(proc, stderr_file, "saving video with metadata")
+                    returncode = _wait_ffmpeg(proc, stderr_file, "saving video with metadata")
                     res = _read_stderr_file(stderr_file)
+                    if returncode != 0 and res == b'':
+                        res = f"ffmpeg exited with status {returncode}\n".encode()
                 except BrokenPipeError as e:
                     _close_proc_stdin(proc)
                     _wait_ffmpeg(proc, stderr_file, "handling a broken ffmpeg metadata pipe")
@@ -242,8 +247,11 @@ def ffmpeg_process(args, video_format, video_metadata, file_path, env):
                         total_frames_output+=1
                     proc.stdin.flush()
                     _close_proc_stdin(proc)
-                    _wait_ffmpeg(proc, stderr_file, "saving video")
+                    returncode = _wait_ffmpeg(proc, stderr_file, "saving video")
                     res = _read_stderr_file(stderr_file)
+                    if returncode != 0:
+                        raise Exception(f"ffmpeg exited with status {returncode}:\n" \
+                                + res.decode(*ENCODE_ARGS))
                 except BrokenPipeError as e:
                     _close_proc_stdin(proc)
                     _wait_ffmpeg(proc, stderr_file, "handling a broken ffmpeg pipe")
@@ -667,10 +675,10 @@ class VideoCombine:
                         except BrokenPipeError:
                             pass
                         _close_proc_stdin(proc)
-                        _wait_ffmpeg(proc, stderr_file, "muxing audio")
+                        returncode = _wait_ffmpeg(proc, stderr_file, "muxing audio")
                         err = _read_stderr_file(stderr_file)
-                    if proc.returncode != 0:
-                        raise Exception("An error occurred in the ffmpeg subprocess:\n" \
+                    if returncode != 0:
+                        raise Exception(f"ffmpeg exited with status {returncode}:\n" \
                                 + err.decode(*ENCODE_ARGS))
                 if err:
                     print(err.decode(*ENCODE_ARGS), end="", file=sys.stderr)
