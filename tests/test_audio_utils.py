@@ -2,7 +2,20 @@ import unittest
 
 import torch
 
-from videohelpersuite.audio_utils import sanitize_audio_waveform
+from videohelpersuite.audio_utils import sanitize_audio_waveform, validate_sample_rate
+
+
+class ValidateSampleRateTests(unittest.TestCase):
+    def test_accepts_positive_integral_sample_rate(self):
+        self.assertEqual(validate_sample_rate(32000), 32000)
+
+    def test_rejects_fractional_sample_rate(self):
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            validate_sample_rate(48000.5)
+
+    def test_rejects_infinite_sample_rate(self):
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            validate_sample_rate(float("inf"))
 
 
 class SanitizeAudioWaveformTests(unittest.TestCase):
