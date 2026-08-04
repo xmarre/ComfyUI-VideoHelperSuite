@@ -68,45 +68,48 @@ class SanitizeAudioWaveformTests(unittest.TestCase):
             sanitize_audio_waveform(torch.zeros((1, 2, 0)))
 
 
-class WaveformToPcmS16leTests(unittest.TestCase):
-    def test_quantizes_and_interleaves_stereo_audio(self):
-        source = torch.tensor(
-            [[[-1.0, 0.0, 1.0], [0.5, -0.5, 0.25]]],
-            dtype=torch.float32,
-        )
+class WaveformToPcmTests(unittest.TestCase):
+    def test_interleaves_channels_and_quantizes_pcm16le(self):
+        waveform = torch.tensor([[[0.0, 1.0], [-1.0, 0.5]]])
 
-        result = waveform_to_pcm_s16le(source)
-        samples = np.frombuffer(result.data, dtype="<i2").reshape(-1, 2)
+        result = waveform_to_pcm_s16le(waveform)
+        decoded = np.frombuffer(result.data, dtype="<i2")
 
         self.assertEqual(result.channels, 2)
-        self.assertEqual(result.samples_per_channel, 3)
-        np.testing.assert_array_equal(
-            samples,
-            np.array(
-                [
-                    [-32768, 16384],
-                    [0, -16384],
-                    [32767, 8192],
-                ],
-                dtype=np.int16,
-            ),
+        self.assertEqual(result.samples, 2)
+        self.assertEqual(decoded.tolist(), [0, -32768, 32767, 16384])
+
+    def test_pads_with_silence(self):
+        result = waveform_to_pcm_s16le(
+            torch.tensor([[[0.5], [-0.5]]]),
+            minimum_samples=3,
+        )
+        decoded = np.frombuffer(result.data, dtype="<i2")
+
+        self.assertEqual(result.samples, 3)
+        self.assertEqual(decoded.tolist(), [16384, -16384, 0, 0, 0, 0])
+
+    def test_reports_sanitization_without_a_second_pass_contract(self):
+        result = waveform_to_pcm_s16le(
+            torch.tensor([[[float("nan"), 2.0]]])
         )
 
-    def test_pads_with_pcm_silence_in_python(self):
-        source = torch.tensor([[[0.5, -0.5]]], dtype=torch.float32)
-
-        result = waveform_to_pcm_s16le(source, minimum_samples=5)
-        samples = np.frombuffer(result.data, dtype="<i2")
-
-        self.assertEqual(result.samples_per_channel, 5)
-        np.testing.assert_array_equal(
-            samples,
-            np.array([16384, -16384, 0, 0, 0], dtype=np.int16),
-        )
+        self.assertTrue(result.changed)
+        self.assertEqual(result.nonfinite_samples, 1)
+        self.assertEqual(result.clipped_samples, 1)
+        self.assertEqual(result.finite_peak, 2.0)
 
     def test_rejects_fractional_minimum_samples(self):
         with self.assertRaisesRegex(ValueError, "non-negative integer"):
             waveform_to_pcm_s16le(torch.zeros((1, 1, 1)), 1.5)
+
+    def test_rejects_negative_minimum_samples(self):
+        with self.assertRaisesRegex(ValueError, "non-negative integer"):
+            waveform_to_pcm_s16le(torch.zeros((1, 1, 1)), -1)
+
+    def test_rejects_boolean_minimum_samples(self):
+        with self.assertRaisesRegex(ValueError, "non-negative integer"):
+            waveform_to_pcm_s16le(torch.zeros((1, 1, 1)), True)
 
 
 if __name__ == "__main__":
