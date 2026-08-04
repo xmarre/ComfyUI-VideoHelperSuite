@@ -1,4 +1,4 @@
-from .audio_utils import sanitize_audio_waveform
+from .audio_utils import sanitize_audio_waveform, validate_sample_rate
 from .logger import logger
 from .nodes import VideoCombine
 
@@ -11,13 +11,7 @@ def _sanitize_audio_input(audio):
     if "sample_rate" not in audio:
         raise ValueError("audio input is missing the sample rate")
 
-    try:
-        sample_rate = int(audio["sample_rate"])
-    except (TypeError, ValueError) as exc:
-        raise ValueError("audio sample rate must be a positive integer") from exc
-    if sample_rate <= 0:
-        raise ValueError("audio sample rate must be a positive integer")
-
+    sample_rate = validate_sample_rate(audio["sample_rate"])
     result = sanitize_audio_waveform(audio["waveform"])
     if result.changed:
         logger.warn(
@@ -43,7 +37,7 @@ class SafeVideoCombine(VideoCombine):
         images=None,
         latents=None,
         filename_prefix="AnimateDiff",
-        format="image/gif",
+        format="image/gif",  # noqa: A002
         pingpong=False,
         save_output=True,
         prompt=None,
