@@ -3,6 +3,7 @@ import os
 import shlex
 import signal
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,7 +21,7 @@ class AudioMuxError(RuntimeError):
     pass
 
 
-def _finalize_timeout():
+def configured_finalize_timeout():
     try:
         timeout = float(os.environ.get("VHS_FFMPEG_FINALIZE_TIMEOUT", "0") or 0)
     except ValueError:
@@ -54,6 +55,10 @@ def build_audio_mux_args(
         "s16le",
         "-i",
         "-",
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
         "-c:v",
         "copy",
     ]
@@ -62,7 +67,7 @@ def build_audio_mux_args(
     return args
 
 
-def _run_mux(args, audio_data, env):
+def _run_mux(args, audio_data, env, timeout):
     try:
         completed = subprocess.run(
             args,
@@ -70,7 +75,7 @@ def _run_mux(args, audio_data, env):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             env=env,
-            timeout=_finalize_timeout(),
+            timeout=timeout,
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
@@ -78,6 +83,15 @@ def _run_mux(args, audio_data, env):
             "ffmpeg timed out while muxing audio: " + shlex.join(args)
         ) from exc
     return completed.returncode, completed.stderr.decode(*ENCODE_ARGS)
+
+
+def _remaining_timeout(deadline):
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise AudioMuxError("ffmpeg audio mux exhausted its configured timeout")
+    return remaining
 
 
 def mux_audio_with_sigfpe_fallback(
@@ -93,6 +107,9 @@ def mux_audio_with_sigfpe_fallback(
     output_path = Path(output_path)
     output_path.unlink(missing_ok=True)
 
+    timeout = configured_finalize_timeout()
+    deadline = time.monotonic() + timeout if timeout is not None else None
+
     primary_args = build_audio_mux_args(
         ffmpeg_path,
         video_path,
@@ -101,11 +118,21 @@ def mux_audio_with_sigfpe_fallback(
         channels,
         audio_pass,
     )
-    returncode, stderr = _run_mux(primary_args, audio_data, env)
+    try:
+        returncode, stderr = _run_mux(
+            primary_args,
+            audio_data,
+            env,
+            _remaining_timeout(deadline),
+        )
+    except AudioMuxError:
+        output_path.unlink(missing_ok=True)
+        raise
     if returncode == 0:
         return AudioMuxResult(stderr=stderr, used_scalar_fallback=False)
 
     if returncode != -signal.SIGFPE:
+        output_path.unlink(missing_ok=True)
         raise AudioMuxError(
             f"ffmpeg exited with status {returncode} while muxing audio.\n"
             f"Command: {shlex.join(primary_args)}\n{stderr}"
@@ -121,12 +148,18 @@ def mux_audio_with_sigfpe_fallback(
         audio_pass,
         disable_cpu_flags=True,
     )
-    fallback_returncode, fallback_stderr = _run_mux(
-        fallback_args,
-        audio_data,
-        env,
-    )
+    try:
+        fallback_returncode, fallback_stderr = _run_mux(
+            fallback_args,
+            audio_data,
+            env,
+            _remaining_timeout(deadline),
+        )
+    except AudioMuxError:
+        output_path.unlink(missing_ok=True)
+        raise
     if fallback_returncode != 0:
+        output_path.unlink(missing_ok=True)
         raise AudioMuxError(
             "ffmpeg received SIGFPE during the normal audio mux and the "
             f"scalar fallback also failed with status {fallback_returncode}.\n"
