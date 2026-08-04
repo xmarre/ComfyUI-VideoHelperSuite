@@ -4,18 +4,21 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from .audio_mux import AudioMuxError, mux_audio_with_sigfpe_fallback
-from .audio_utils import (
-    sanitize_audio_waveform,
-    validate_sample_rate,
-    waveform_to_pcm_s16le,
+from .audio_mux import (
+    AudioMuxError,
+    configured_finalize_timeout,
+    mux_audio_with_sigfpe_fallback,
 )
+from .audio_utils import validate_sample_rate, waveform_to_pcm_s16le
 from .logger import logger
 from .nodes import VideoCombine, apply_format_widgets
 from .utils import ffmpeg_path
 
 
-def _sanitize_audio_input(audio):
+DEFAULT_FFPROBE_TIMEOUT = 30.0
+
+
+def _validate_audio_input(audio):
     if not isinstance(audio, dict):
         raise TypeError("audio input must be a dictionary")
     if "waveform" not in audio:
@@ -23,25 +26,15 @@ def _sanitize_audio_input(audio):
     if "sample_rate" not in audio:
         raise ValueError("audio input is missing the sample rate")
 
-    sample_rate = validate_sample_rate(audio["sample_rate"])
-    result = sanitize_audio_waveform(audio["waveform"])
-    if result.changed:
-        logger.warn(
-            "Sanitized audio before ffmpeg mux: "
-            f"replaced {result.nonfinite_samples} non-finite sample(s), "
-            f"clipped {result.clipped_samples} out-of-range sample(s), "
-            f"finite peak={result.finite_peak:.6g}"
-        )
-
-    sanitized_audio = dict(audio)
-    sanitized_audio["waveform"] = result.waveform
-    sanitized_audio["sample_rate"] = sample_rate
-    return sanitized_audio
+    validated_audio = dict(audio)
+    validated_audio["sample_rate"] = validate_sample_rate(audio["sample_rate"])
+    return validated_audio
 
 
 def _ffprobe_path():
     if ffmpeg_path:
-        sibling = Path(ffmpeg_path).with_name("ffprobe")
+        ffmpeg = Path(ffmpeg_path)
+        sibling = ffmpeg.with_name(f"ffprobe{ffmpeg.suffix}")
         if sibling.is_file():
             return str(sibling)
     return shutil.which("ffprobe")
@@ -51,22 +44,28 @@ def _probe_video_duration(video_path):
     probe = _ffprobe_path()
     if probe is None:
         return None
-    completed = subprocess.run(
-        [
-            probe,
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            str(video_path),
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        check=False,
-    )
+
+    timeout = configured_finalize_timeout() or DEFAULT_FFPROBE_TIMEOUT
+    try:
+        completed = subprocess.run(
+            [
+                probe,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(video_path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
     if completed.returncode != 0:
         return None
     try:
@@ -127,7 +126,7 @@ class SafeVideoCombine(VideoCombine):
                 **kwargs,
             )
 
-        audio = _sanitize_audio_input(audio)
+        audio = _validate_audio_input(audio)
         format_name = format.split("/", 1)[1]
         video_format = _format_options(format_name, manual_format_widgets, kwargs)
 
@@ -195,6 +194,14 @@ class SafeVideoCombine(VideoCombine):
             audio["waveform"],
             minimum_samples=minimum_samples,
         )
+        if pcm.changed:
+            logger.warn(
+                "Sanitized audio before ffmpeg mux: "
+                f"replaced {pcm.nonfinite_samples} non-finite sample(s), "
+                f"clipped {pcm.clipped_samples} out-of-range sample(s), "
+                f"finite peak={pcm.finite_peak:.6g}"
+            )
+
         audio_pass = video_format.get("audio_pass", ["-c:a", "libopus"])
         env = os.environ.copy()
         if "environment" in video_format:
