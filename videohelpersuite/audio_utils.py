@@ -1,6 +1,7 @@
 import math
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 
 
@@ -14,6 +15,13 @@ class AudioSanitizationResult:
     @property
     def changed(self):
         return self.nonfinite_samples > 0 or self.clipped_samples > 0
+
+
+@dataclass(frozen=True)
+class PcmAudioBuffer:
+    data: bytes
+    channels: int
+    samples_per_channel: int
 
 
 def validate_sample_rate(value):
@@ -38,7 +46,7 @@ def validate_sample_rate(value):
 
 
 def sanitize_audio_waveform(waveform):
-    """Return a CPU float32 waveform that is safe to stream to ffmpeg.
+    """Return a CPU float32 waveform that is safe to serialize.
 
     ComfyUI AUDIO waveforms use the shape ``[batch, channels, samples]``.
     Video Combine only supports a single audio item, so reject ambiguous
@@ -80,4 +88,44 @@ def sanitize_audio_waveform(waveform):
         nonfinite_samples=nonfinite_samples,
         clipped_samples=clipped_samples,
         finite_peak=finite_peak,
+    )
+
+
+def waveform_to_pcm_s16le(waveform, minimum_samples=0):
+    """Convert one sanitized ComfyUI waveform to interleaved signed PCM16.
+
+    Padding is performed in Python so the ffmpeg mux pass does not need the
+    floating-point ``apad`` filter. The returned byte order is explicitly
+    little-endian for the ffmpeg ``s16le`` demuxer.
+    """
+    if isinstance(minimum_samples, bool):
+        raise ValueError("minimum_samples must be a non-negative integer")
+    try:
+        minimum_samples_int = int(minimum_samples)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("minimum_samples must be a non-negative integer") from exc
+    if minimum_samples_int != minimum_samples or minimum_samples_int < 0:
+        raise ValueError("minimum_samples must be a non-negative integer")
+
+    sanitized = sanitize_audio_waveform(waveform).waveform
+    current_samples = sanitized.size(2)
+    if current_samples < minimum_samples_int:
+        sanitized = torch.nn.functional.pad(
+            sanitized,
+            (0, minimum_samples_int - current_samples),
+        )
+
+    scaled = torch.where(
+        sanitized < 0,
+        sanitized * 32768.0,
+        sanitized * 32767.0,
+    )
+    pcm = scaled.round().clamp(-32768, 32767).to(torch.int16)
+    interleaved = pcm.squeeze(0).transpose(0, 1).contiguous().numpy()
+    data = interleaved.astype(np.dtype("<i2"), copy=False).tobytes()
+
+    return PcmAudioBuffer(
+        data=data,
+        channels=int(sanitized.size(1)),
+        samples_per_channel=int(sanitized.size(2)),
     )
