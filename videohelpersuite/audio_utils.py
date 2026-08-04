@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 
 import torch
@@ -13,6 +14,27 @@ class AudioSanitizationResult:
     @property
     def changed(self):
         return self.nonfinite_samples > 0 or self.clipped_samples > 0
+
+
+def validate_sample_rate(value):
+    """Return a positive integral sample rate without lossy conversion."""
+    if isinstance(value, bool):
+        raise ValueError("audio sample rate must be a positive integer")
+
+    try:
+        numeric_value = float(value)
+        sample_rate = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("audio sample rate must be a positive integer") from exc
+
+    if (
+        not math.isfinite(numeric_value)
+        or numeric_value != sample_rate
+        or sample_rate <= 0
+    ):
+        raise ValueError("audio sample rate must be a positive integer")
+
+    return sample_rate
 
 
 def sanitize_audio_waveform(waveform):
