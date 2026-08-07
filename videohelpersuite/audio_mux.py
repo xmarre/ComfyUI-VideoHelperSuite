@@ -153,9 +153,9 @@ def mux_audio_with_sigfpe_fallback(
     # ffmpeg process can hold resources.
     if force_scalar or returncode != -signal.SIGFPE:
         output_path.unlink(missing_ok=True)
-        mode = " scalar" if force_scalar else ""
+        mode = "scalar" if force_scalar else "normal"
         raise AudioMuxError(
-            f"ffmpeg exited with status {returncode} while muxing audio on the{mode} path.\n"
+            f"ffmpeg exited with status {returncode} while muxing audio on the {mode} path.\n"
             f"Command: {shlex.join(primary_args)}\n{stderr}"
         )
 
