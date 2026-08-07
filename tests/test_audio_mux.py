@@ -9,7 +9,9 @@ from unittest import mock
 
 from videohelpersuite.audio_mux import (
     AudioMuxError,
+    DEFAULT_WSL_FINALIZE_TIMEOUT,
     build_audio_mux_args,
+    configured_finalize_timeout,
     mux_audio_with_sigfpe_fallback,
 )
 
@@ -62,6 +64,102 @@ class AudioMuxCommandTests(unittest.TestCase):
 
 
 class AudioMuxFallbackTests(unittest.TestCase):
+    def setUp(self):
+        self._wsl_patcher = mock.patch(
+            "videohelpersuite.audio_mux._is_wsl",
+            return_value=False,
+        )
+        self._is_wsl_mock = self._wsl_patcher.start()
+
+    def tearDown(self):
+        self._wsl_patcher.stop()
+
+    def test_wsl_has_bounded_default_timeout(self):
+        self._is_wsl_mock.return_value = True
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                configured_finalize_timeout(),
+                DEFAULT_WSL_FINALIZE_TIMEOUT,
+            )
+
+    def test_explicit_zero_disables_wsl_default_timeout(self):
+        self._is_wsl_mock.return_value = True
+        with mock.patch.dict(
+            os.environ,
+            {"VHS_FFMPEG_FINALIZE_TIMEOUT": "0"},
+            clear=True,
+        ):
+            self.assertIsNone(configured_finalize_timeout())
+
+    @mock.patch("videohelpersuite.audio_mux.subprocess.run")
+    def test_wsl_uses_seekable_scalar_path_on_first_attempt(self, run_mock):
+        self._is_wsl_mock.return_value = True
+        first_wav = None
+
+        def succeed(args, **kwargs):
+            nonlocal first_wav
+            input_positions = [
+                index for index, arg in enumerate(args) if arg == "-i"
+            ]
+            first_wav = Path(args[input_positions[-1] + 1])
+            self.assertTrue(first_wav.is_file())
+            self.assertIsNone(kwargs["input"])
+            with wave.open(str(first_wav), "rb") as wav_file:
+                self.assertEqual(wav_file.getnchannels(), 2)
+                self.assertEqual(wav_file.getsampwidth(), 2)
+                self.assertEqual(wav_file.getframerate(), 32000)
+                self.assertEqual(wav_file.readframes(2), b"\0" * 8)
+            return subprocess.CompletedProcess(args, 0, b"", b"")
+
+        run_mock.side_effect = succeed
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch.dict(os.environ, {}, clear=True):
+                result = mux_audio_with_sigfpe_fallback(
+                    ffmpeg_path="/usr/bin/ffmpeg",
+                    video_path="video.mp4",
+                    output_path=Path(temp_dir) / "output.mp4",
+                    sample_rate=32000,
+                    channels=2,
+                    audio_pass=["-c:a", "aac"],
+                    audio_data=b"\0" * 8,
+                    env={},
+                )
+
+        self.assertFalse(result.used_scalar_fallback)
+        self.assertEqual(run_mock.call_count, 1)
+        args = run_mock.call_args.args[0]
+        self.assertEqual(args[args.index("-cpuflags") + 1], "0")
+        self.assertNotIn("s16le", args)
+        self.assertNotIn("-ar", args)
+        self.assertNotIn("-ac", args)
+        timeout = run_mock.call_args.kwargs["timeout"]
+        self.assertGreater(timeout, 0)
+        self.assertLessEqual(timeout, DEFAULT_WSL_FINALIZE_TIMEOUT)
+        self.assertIsNotNone(first_wav)
+        self.assertFalse(first_wav.exists())
+
+    @mock.patch("videohelpersuite.audio_mux.subprocess.run")
+    def test_wsl_seekable_scalar_failure_does_not_retry(self, run_mock):
+        self._is_wsl_mock.return_value = True
+        run_mock.return_value = subprocess.CompletedProcess([], 1, b"", b"boom")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "output.mp4"
+            with self.assertRaisesRegex(AudioMuxError, "WSL seekable scalar path"):
+                mux_audio_with_sigfpe_fallback(
+                    ffmpeg_path="/usr/bin/ffmpeg",
+                    video_path="video.mp4",
+                    output_path=output_path,
+                    sample_rate=32000,
+                    channels=2,
+                    audio_pass=["-c:a", "aac"],
+                    audio_data=b"\0" * 8,
+                    env={},
+                )
+            self.assertFalse(output_path.exists())
+
+        self.assertEqual(run_mock.call_count, 1)
+
     @mock.patch("videohelpersuite.audio_mux.subprocess.run")
     def test_sigfpe_retries_with_seekable_wav(self, run_mock):
         fallback_wav = None
