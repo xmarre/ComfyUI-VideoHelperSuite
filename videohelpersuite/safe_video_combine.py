@@ -177,18 +177,21 @@ class SafeVideoCombine(VideoCombine):
         sample_rate = audio["sample_rate"]
         trim_to_audio = video_format.get("trim_to_audio", "False") != "False"
 
+        # Probe once for both Python-side padding and an explicit mux duration.
+        # Supplying -t lets the WSL path avoid FFmpeg's -shortest scheduler while
+        # preserving the same final-duration semantics when probing succeeds.
+        video_duration = _probe_video_duration(video_path)
+        if video_duration is None:
+            logger.warn(
+                "Could not probe the video duration; audio will not be "
+                "pre-padded and the mux must fall back to -shortest"
+            )
+
         minimum_samples = 0
-        if not trim_to_audio:
-            duration = _probe_video_duration(video_path)
-            if duration is None:
-                logger.warn(
-                    "Could not probe the video duration; audio will not be "
-                    "pre-padded before muxing"
-                )
-            else:
-                # Match the previous one-second safety margin, but create the
-                # silence in Python instead of using ffmpeg's apad filter.
-                minimum_samples = math.ceil((duration + 1.0) * sample_rate)
+        if not trim_to_audio and video_duration is not None:
+            # Match the previous one-second safety margin, but create the
+            # silence in Python instead of using ffmpeg's apad filter.
+            minimum_samples = math.ceil((video_duration + 1.0) * sample_rate)
 
         pcm = waveform_to_pcm_s16le(
             audio["waveform"],
@@ -201,6 +204,14 @@ class SafeVideoCombine(VideoCombine):
                 f"clipped {pcm.clipped_samples} out-of-range sample(s), "
                 f"finite peak={pcm.finite_peak:.6g}"
             )
+
+        output_duration = None
+        if video_duration is not None:
+            if trim_to_audio:
+                audio_duration = pcm.samples / sample_rate
+                output_duration = min(video_duration, audio_duration)
+            else:
+                output_duration = video_duration
 
         audio_pass = video_format.get("audio_pass", ["-c:a", "libopus"])
         env = os.environ.copy()
@@ -217,13 +228,19 @@ class SafeVideoCombine(VideoCombine):
                 audio_pass=audio_pass,
                 audio_data=pcm.data,
                 env=env,
+                output_duration=output_duration,
             )
         except AudioMuxError as exc:
             raise Exception(
                 f"{exc}\nVideo-only output was preserved at: {video_path}"
             ) from exc
 
-        if mux_result.used_scalar_fallback:
+        if mux_result.used_codec_fallback:
+            logger.warn(
+                "ffmpeg AAC mux received SIGFPE on WSL; recovered with the "
+                "seekable scalar ALAC-in-MP4 fallback"
+            )
+        elif mux_result.used_scalar_fallback:
             logger.warn(
                 "ffmpeg audio mux received SIGFPE; recovered automatically "
                 "with CPU SIMD disabled"
