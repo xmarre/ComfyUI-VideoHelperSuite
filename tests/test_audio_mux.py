@@ -31,6 +31,7 @@ class AudioMuxCommandTests(unittest.TestCase):
         self.assertNotIn("f32le", args)
         self.assertFalse(any("apad" in arg for arg in args))
         self.assertEqual(args[args.index("-threads:a") + 1], "1")
+        self.assertIn("-shortest", args)
 
         pcm_input = len(args) - 1 - args[::-1].index("-i")
         self.assertEqual(args[pcm_input + 1], "-")
@@ -61,6 +62,22 @@ class AudioMuxCommandTests(unittest.TestCase):
         self.assertEqual(args[args.index("-cpuflags") + 1], "0")
         input_positions = [index for index, arg in enumerate(args) if arg == "-i"]
         self.assertEqual(args[input_positions[-1] + 1], "audio.wav")
+
+    def test_explicit_duration_replaces_shortest(self):
+        args = build_audio_mux_args(
+            "/usr/bin/ffmpeg",
+            "video.mp4",
+            "output.mp4",
+            32000,
+            2,
+            ["-c:a", "aac"],
+            disable_cpu_flags=True,
+            audio_input_path="audio.wav",
+            output_duration=7.25,
+        )
+
+        self.assertNotIn("-shortest", args)
+        self.assertEqual(args[args.index("-t") + 1], "7.250000000")
 
 
 class AudioMuxFallbackTests(unittest.TestCase):
@@ -123,15 +140,19 @@ class AudioMuxFallbackTests(unittest.TestCase):
                     audio_pass=["-c:a", "aac"],
                     audio_data=b"\0" * 8,
                     env={},
+                    output_duration=7.25,
                 )
 
         self.assertFalse(result.used_scalar_fallback)
+        self.assertFalse(result.used_codec_fallback)
         self.assertEqual(run_mock.call_count, 1)
         args = run_mock.call_args.args[0]
         self.assertEqual(args[args.index("-cpuflags") + 1], "0")
         self.assertNotIn("s16le", args)
         self.assertNotIn("-ar", args)
         self.assertNotIn("-ac", args)
+        self.assertNotIn("-shortest", args)
+        self.assertEqual(args[args.index("-t") + 1], "7.250000000")
         timeout = run_mock.call_args.kwargs["timeout"]
         self.assertGreater(timeout, 0)
         self.assertLessEqual(timeout, DEFAULT_WSL_FINALIZE_TIMEOUT)
@@ -139,7 +160,46 @@ class AudioMuxFallbackTests(unittest.TestCase):
         self.assertFalse(first_wav.exists())
 
     @mock.patch("videohelpersuite.audio_mux.subprocess.run")
-    def test_wsl_seekable_scalar_failure_does_not_retry(self, run_mock):
+    def test_wsl_sigfpe_retries_with_alac_and_explicit_duration(self, run_mock):
+        self._is_wsl_mock.return_value = True
+        run_mock.side_effect = [
+            subprocess.CompletedProcess([], -signal.SIGFPE, b"", b"aac failed"),
+            subprocess.CompletedProcess([], 0, b"", b"alac recovered"),
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch.dict(os.environ, {}, clear=True):
+                result = mux_audio_with_sigfpe_fallback(
+                    ffmpeg_path="/usr/bin/ffmpeg",
+                    video_path="video.mp4",
+                    output_path=Path(temp_dir) / "output.mp4",
+                    sample_rate=32000,
+                    channels=2,
+                    audio_pass=["-c:a", "aac", "-movflags", "use_metadata_tags"],
+                    audio_data=b"\0" * 8,
+                    env={},
+                    output_duration=7.0,
+                )
+
+        self.assertTrue(result.used_scalar_fallback)
+        self.assertTrue(result.used_codec_fallback)
+        self.assertEqual(result.stderr, "alac recovered")
+        self.assertEqual(run_mock.call_count, 2)
+        primary_args = run_mock.call_args_list[0].args[0]
+        fallback_args = run_mock.call_args_list[1].args[0]
+        self.assertEqual(primary_args[primary_args.index("-c:a") + 1], "aac")
+        self.assertEqual(fallback_args[fallback_args.index("-c:a") + 1], "alac")
+        self.assertNotIn("-shortest", primary_args)
+        self.assertNotIn("-shortest", fallback_args)
+        self.assertEqual(primary_args[primary_args.index("-t") + 1], "7.000000000")
+        self.assertEqual(fallback_args[fallback_args.index("-t") + 1], "7.000000000")
+        self.assertEqual(
+            fallback_args[fallback_args.index("-movflags") + 1],
+            "use_metadata_tags",
+        )
+
+    @mock.patch("videohelpersuite.audio_mux.subprocess.run")
+    def test_wsl_non_sigfpe_failure_does_not_retry(self, run_mock):
         self._is_wsl_mock.return_value = True
         run_mock.return_value = subprocess.CompletedProcess([], 1, b"", b"boom")
 
@@ -155,10 +215,40 @@ class AudioMuxFallbackTests(unittest.TestCase):
                     audio_pass=["-c:a", "aac"],
                     audio_data=b"\0" * 8,
                     env={},
+                    output_duration=7.0,
                 )
             self.assertFalse(output_path.exists())
 
         self.assertEqual(run_mock.call_count, 1)
+
+    @mock.patch("videohelpersuite.audio_mux.subprocess.run")
+    def test_wsl_failing_alac_fallback_reports_both_attempts(self, run_mock):
+        self._is_wsl_mock.return_value = True
+        run_mock.side_effect = [
+            subprocess.CompletedProcess([], -signal.SIGFPE, b"", b"aac failed"),
+            subprocess.CompletedProcess([], -signal.SIGFPE, b"", b"alac failed"),
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "output.mp4"
+            with self.assertRaisesRegex(
+                AudioMuxError,
+                "(?s)ALAC codec fallback also failed.*aac failed.*alac failed",
+            ):
+                mux_audio_with_sigfpe_fallback(
+                    ffmpeg_path="/usr/bin/ffmpeg",
+                    video_path="video.mp4",
+                    output_path=output_path,
+                    sample_rate=32000,
+                    channels=2,
+                    audio_pass=["-c:a", "aac"],
+                    audio_data=b"\0" * 8,
+                    env={},
+                    output_duration=7.0,
+                )
+            self.assertFalse(output_path.exists())
+
+        self.assertEqual(run_mock.call_count, 2)
 
     @mock.patch("videohelpersuite.audio_mux.subprocess.run")
     def test_sigfpe_retries_with_seekable_wav(self, run_mock):
@@ -202,6 +292,7 @@ class AudioMuxFallbackTests(unittest.TestCase):
             )
 
         self.assertTrue(result.used_scalar_fallback)
+        self.assertFalse(result.used_codec_fallback)
         self.assertEqual(result.stderr, "fallback")
         self.assertEqual(run_mock.call_count, 2)
         primary_args = run_mock.call_args_list[0].args[0]
