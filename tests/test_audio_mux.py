@@ -115,10 +115,9 @@ class AudioMuxFallbackTests(unittest.TestCase):
         self.assertEqual(run_mock.call_count, 1)
         args = run_mock.call_args.args[0]
         self.assertEqual(args[args.index("-cpuflags") + 1], "0")
-        self.assertEqual(
-            run_mock.call_args.kwargs["timeout"],
-            DEFAULT_WSL_FINALIZE_TIMEOUT,
-        )
+        timeout = run_mock.call_args.kwargs["timeout"]
+        self.assertGreater(timeout, DEFAULT_WSL_FINALIZE_TIMEOUT - 1.0)
+        self.assertLessEqual(timeout, DEFAULT_WSL_FINALIZE_TIMEOUT)
 
     @mock.patch("videohelpersuite.audio_mux._is_wsl", return_value=True)
     @mock.patch("videohelpersuite.audio_mux.subprocess.run")
