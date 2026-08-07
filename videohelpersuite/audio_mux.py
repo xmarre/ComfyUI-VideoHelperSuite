@@ -2,6 +2,7 @@ import math
 import os
 import shlex
 import signal
+import shutil
 import subprocess
 import tempfile
 import time
@@ -168,31 +169,42 @@ def mux_audio_with_sigfpe_fallback(
 
     output_path.unlink(missing_ok=True)
     try:
-        with tempfile.TemporaryDirectory(
-            prefix=".vhs-audio-",
-            dir=output_path.parent,
-        ) as temp_dir:
-            wav_path = Path(temp_dir) / "audio.wav"
-            _write_pcm_wav(wav_path, audio_data, sample_rate, channels)
-            fallback_args = build_audio_mux_args(
-                ffmpeg_path,
-                video_path,
-                output_path,
-                sample_rate,
-                channels,
-                audio_pass,
-                disable_cpu_flags=True,
-                audio_input_path=wav_path,
+        temp_dir = Path(
+            tempfile.mkdtemp(
+                prefix=".vhs-audio-",
+                dir=output_path.parent,
             )
-            fallback_returncode, fallback_stderr = _run_mux(
-                fallback_args,
-                None,
-                env,
-                _remaining_timeout(deadline),
-            )
+        )
+    except OSError as exc:
+        raise AudioMuxError(
+            "failed to create the seekable WAV fallback directory near "
+            f"{output_path}"
+        ) from exc
+
+    try:
+        wav_path = temp_dir / "audio.wav"
+        _write_pcm_wav(wav_path, audio_data, sample_rate, channels)
+        fallback_args = build_audio_mux_args(
+            ffmpeg_path,
+            video_path,
+            output_path,
+            sample_rate,
+            channels,
+            audio_pass,
+            disable_cpu_flags=True,
+            audio_input_path=wav_path,
+        )
+        fallback_returncode, fallback_stderr = _run_mux(
+            fallback_args,
+            None,
+            env,
+            _remaining_timeout(deadline),
+        )
     except AudioMuxError:
         output_path.unlink(missing_ok=True)
         raise
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
     if fallback_returncode != 0:
         output_path.unlink(missing_ok=True)
