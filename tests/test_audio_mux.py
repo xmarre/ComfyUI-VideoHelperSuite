@@ -207,6 +207,37 @@ class AudioMuxFallbackTests(unittest.TestCase):
         self.assertEqual(run_mock.call_count, 1)
 
     @mock.patch("videohelpersuite.audio_mux.subprocess.run")
+    def test_temp_directory_failure_is_reported_as_audio_mux_error(
+        self,
+        run_mock,
+    ):
+        run_mock.return_value = subprocess.CompletedProcess(
+            [],
+            -signal.SIGFPE,
+            b"",
+            b"primary",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch(
+                "videohelpersuite.audio_mux.tempfile.mkdtemp",
+                side_effect=OSError("disk error"),
+            ):
+                with self.assertRaisesRegex(AudioMuxError, "fallback directory"):
+                    mux_audio_with_sigfpe_fallback(
+                        ffmpeg_path="/usr/bin/ffmpeg",
+                        video_path="video.mp4",
+                        output_path=Path(temp_dir) / "output.mp4",
+                        sample_rate=32000,
+                        channels=2,
+                        audio_pass=["-c:a", "aac"],
+                        audio_data=b"\0" * 8,
+                        env={},
+                    )
+
+        self.assertEqual(run_mock.call_count, 1)
+
+    @mock.patch("videohelpersuite.audio_mux.subprocess.run")
     def test_timeout_removes_partial_output(self, run_mock):
         def time_out(args, **kwargs):
             Path(args[-1]).write_bytes(b"partial")
