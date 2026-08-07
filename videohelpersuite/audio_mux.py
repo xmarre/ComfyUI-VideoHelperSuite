@@ -2,8 +2,11 @@ import math
 import os
 import shlex
 import signal
+import shutil
 import subprocess
+import tempfile
 import time
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -40,21 +43,26 @@ def build_audio_mux_args(
     audio_pass,
     *,
     disable_cpu_flags=False,
+    audio_input_path=None,
 ):
     args = [ffmpeg_path, "-nostdin", "-v", "error", "-y"]
     if disable_cpu_flags:
         args += ["-cpuflags", "0"]
+    args += ["-i", str(video_path)]
+    if audio_input_path is None:
+        args += [
+            "-ar",
+            str(sample_rate),
+            "-ac",
+            str(channels),
+            "-f",
+            "s16le",
+            "-i",
+            "-",
+        ]
+    else:
+        args += ["-i", str(audio_input_path)]
     args += [
-        "-i",
-        str(video_path),
-        "-ar",
-        str(sample_rate),
-        "-ac",
-        str(channels),
-        "-f",
-        "s16le",
-        "-i",
-        "-",
         "-map",
         "0:v:0",
         "-map",
@@ -92,6 +100,27 @@ def _remaining_timeout(deadline):
     if remaining <= 0:
         raise AudioMuxError("ffmpeg audio mux exhausted its configured timeout")
     return remaining
+
+
+def _write_pcm_wav(path, audio_data, sample_rate, channels):
+    if channels < 1:
+        raise AudioMuxError("audio channel count must be positive")
+    frame_size = channels * 2
+    if len(audio_data) % frame_size != 0:
+        raise AudioMuxError(
+            "PCM16 audio byte length is not aligned to the channel frame size"
+        )
+
+    try:
+        with wave.open(str(path), "wb") as wav_file:
+            wav_file.setnchannels(channels)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(sample_rate)
+            wav_file.writeframes(audio_data)
+    except (OSError, wave.Error) as exc:
+        raise AudioMuxError(
+            f"failed to create seekable WAV fallback input at {path}"
+        ) from exc
 
 
 def mux_audio_with_sigfpe_fallback(
@@ -139,30 +168,50 @@ def mux_audio_with_sigfpe_fallback(
         )
 
     output_path.unlink(missing_ok=True)
-    fallback_args = build_audio_mux_args(
-        ffmpeg_path,
-        video_path,
-        output_path,
-        sample_rate,
-        channels,
-        audio_pass,
-        disable_cpu_flags=True,
-    )
     try:
+        temp_dir = Path(
+            tempfile.mkdtemp(
+                prefix=".vhs-audio-",
+                dir=output_path.parent,
+            )
+        )
+    except OSError as exc:
+        raise AudioMuxError(
+            "failed to create the seekable WAV fallback directory near "
+            f"{output_path}"
+        ) from exc
+
+    try:
+        wav_path = temp_dir / "audio.wav"
+        _write_pcm_wav(wav_path, audio_data, sample_rate, channels)
+        fallback_args = build_audio_mux_args(
+            ffmpeg_path,
+            video_path,
+            output_path,
+            sample_rate,
+            channels,
+            audio_pass,
+            disable_cpu_flags=True,
+            audio_input_path=wav_path,
+        )
         fallback_returncode, fallback_stderr = _run_mux(
             fallback_args,
-            audio_data,
+            None,
             env,
             _remaining_timeout(deadline),
         )
     except AudioMuxError:
         output_path.unlink(missing_ok=True)
         raise
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
     if fallback_returncode != 0:
         output_path.unlink(missing_ok=True)
         raise AudioMuxError(
             "ffmpeg received SIGFPE during the normal audio mux and the "
-            f"scalar fallback also failed with status {fallback_returncode}.\n"
+            "seekable WAV fallback also failed with status "
+            f"{fallback_returncode}.\n"
             f"Primary command: {shlex.join(primary_args)}\n"
             f"Primary stderr:\n{stderr}\n"
             f"Fallback command: {shlex.join(fallback_args)}\n"
