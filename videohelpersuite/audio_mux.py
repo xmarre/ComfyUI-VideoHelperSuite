@@ -1,5 +1,6 @@
 import math
 import os
+import platform
 import shlex
 import signal
 import subprocess
@@ -9,6 +10,7 @@ from pathlib import Path
 
 
 ENCODE_ARGS = ("utf-8", "backslashreplace")
+DEFAULT_WSL_FINALIZE_TIMEOUT = 120.0
 
 
 @dataclass(frozen=True)
@@ -21,9 +23,22 @@ class AudioMuxError(RuntimeError):
     pass
 
 
+def _is_wsl():
+    """Return True when running inside Windows Subsystem for Linux."""
+    if os.name != "posix":
+        return False
+    if os.environ.get("WSL_INTEROP") or os.environ.get("WSL_DISTRO_NAME"):
+        return True
+    release = platform.release().lower()
+    return "microsoft" in release or "wsl" in release
+
+
 def configured_finalize_timeout():
+    raw_timeout = os.environ.get("VHS_FFMPEG_FINALIZE_TIMEOUT")
+    if raw_timeout is None:
+        return DEFAULT_WSL_FINALIZE_TIMEOUT if _is_wsl() else None
     try:
-        timeout = float(os.environ.get("VHS_FFMPEG_FINALIZE_TIMEOUT", "0") or 0)
+        timeout = float(raw_timeout or 0)
     except ValueError:
         return None
     if not math.isfinite(timeout) or timeout <= 0:
@@ -109,6 +124,7 @@ def mux_audio_with_sigfpe_fallback(
 
     timeout = configured_finalize_timeout()
     deadline = time.monotonic() + timeout if timeout is not None else None
+    force_scalar = _is_wsl()
 
     primary_args = build_audio_mux_args(
         ffmpeg_path,
@@ -117,6 +133,7 @@ def mux_audio_with_sigfpe_fallback(
         sample_rate,
         channels,
         audio_pass,
+        disable_cpu_flags=force_scalar,
     )
     try:
         returncode, stderr = _run_mux(
@@ -131,10 +148,14 @@ def mux_audio_with_sigfpe_fallback(
     if returncode == 0:
         return AudioMuxResult(stderr=stderr, used_scalar_fallback=False)
 
-    if returncode != -signal.SIGFPE:
+    # WSL has already used the scalar path. Retrying the same failed command
+    # cannot recover anything and only extends the period in which a broken
+    # ffmpeg process can hold resources.
+    if force_scalar or returncode != -signal.SIGFPE:
         output_path.unlink(missing_ok=True)
+        mode = " scalar" if force_scalar else ""
         raise AudioMuxError(
-            f"ffmpeg exited with status {returncode} while muxing audio.\n"
+            f"ffmpeg exited with status {returncode} while muxing audio on the{mode} path.\n"
             f"Command: {shlex.join(primary_args)}\n{stderr}"
         )
 
