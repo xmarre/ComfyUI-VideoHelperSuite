@@ -1,5 +1,6 @@
 import math
 import os
+import platform
 import shlex
 import signal
 import shutil
@@ -12,6 +13,7 @@ from pathlib import Path
 
 
 ENCODE_ARGS = ("utf-8", "backslashreplace")
+DEFAULT_WSL_FINALIZE_TIMEOUT = 120.0
 
 
 @dataclass(frozen=True)
@@ -24,9 +26,22 @@ class AudioMuxError(RuntimeError):
     pass
 
 
+def _is_wsl():
+    """Return True when running inside Windows Subsystem for Linux."""
+    if os.name != "posix":
+        return False
+    if os.environ.get("WSL_INTEROP") or os.environ.get("WSL_DISTRO_NAME"):
+        return True
+    release = platform.release().lower()
+    return "microsoft" in release or "wsl" in release
+
+
 def configured_finalize_timeout():
+    raw_timeout = os.environ.get("VHS_FFMPEG_FINALIZE_TIMEOUT")
+    if raw_timeout is None:
+        return DEFAULT_WSL_FINALIZE_TIMEOUT if _is_wsl() else None
     try:
-        timeout = float(os.environ.get("VHS_FFMPEG_FINALIZE_TIMEOUT", "0") or 0)
+        timeout = float(raw_timeout or 0)
     except ValueError:
         return None
     if not math.isfinite(timeout) or timeout <= 0:
@@ -123,6 +138,54 @@ def _write_pcm_wav(path, audio_data, sample_rate, channels):
         ) from exc
 
 
+def _run_seekable_scalar_mux(
+    ffmpeg_path,
+    video_path,
+    output_path,
+    sample_rate,
+    channels,
+    audio_pass,
+    audio_data,
+    env,
+    deadline,
+):
+    try:
+        temp_dir = Path(
+            tempfile.mkdtemp(
+                prefix=".vhs-audio-",
+                dir=output_path.parent,
+            )
+        )
+    except OSError as exc:
+        raise AudioMuxError(
+            "failed to create the seekable WAV fallback directory near "
+            f"{output_path}"
+        ) from exc
+
+    try:
+        wav_path = temp_dir / "audio.wav"
+        _write_pcm_wav(wav_path, audio_data, sample_rate, channels)
+        args = build_audio_mux_args(
+            ffmpeg_path,
+            video_path,
+            output_path,
+            sample_rate,
+            channels,
+            audio_pass,
+            disable_cpu_flags=True,
+            audio_input_path=wav_path,
+        )
+        returncode, stderr = _run_mux(
+            args,
+            None,
+            env,
+            _remaining_timeout(deadline),
+        )
+        return returncode, stderr, args
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 def mux_audio_with_sigfpe_fallback(
     ffmpeg_path,
     video_path,
@@ -138,6 +201,35 @@ def mux_audio_with_sigfpe_fallback(
 
     timeout = configured_finalize_timeout()
     deadline = time.monotonic() + timeout if timeout is not None else None
+
+    # On WSL, avoid both parts of the mux topology already implicated in hard
+    # failures: raw non-seekable PCM stdin and FFmpeg's normal CPU SIMD path.
+    # Use the seekable WAV + scalar path from the first attempt instead of
+    # waiting for a SIGFPE that may never return control to Python.
+    if _is_wsl():
+        try:
+            returncode, stderr, args = _run_seekable_scalar_mux(
+                ffmpeg_path,
+                video_path,
+                output_path,
+                sample_rate,
+                channels,
+                audio_pass,
+                audio_data,
+                env,
+                deadline,
+            )
+        except AudioMuxError:
+            output_path.unlink(missing_ok=True)
+            raise
+        if returncode != 0:
+            output_path.unlink(missing_ok=True)
+            raise AudioMuxError(
+                f"ffmpeg exited with status {returncode} while muxing audio "
+                "on the WSL seekable scalar path.\n"
+                f"Command: {shlex.join(args)}\n{stderr}"
+            )
+        return AudioMuxResult(stderr=stderr, used_scalar_fallback=False)
 
     primary_args = build_audio_mux_args(
         ffmpeg_path,
@@ -169,42 +261,22 @@ def mux_audio_with_sigfpe_fallback(
 
     output_path.unlink(missing_ok=True)
     try:
-        temp_dir = Path(
-            tempfile.mkdtemp(
-                prefix=".vhs-audio-",
-                dir=output_path.parent,
+        fallback_returncode, fallback_stderr, fallback_args = (
+            _run_seekable_scalar_mux(
+                ffmpeg_path,
+                video_path,
+                output_path,
+                sample_rate,
+                channels,
+                audio_pass,
+                audio_data,
+                env,
+                deadline,
             )
-        )
-    except OSError as exc:
-        raise AudioMuxError(
-            "failed to create the seekable WAV fallback directory near "
-            f"{output_path}"
-        ) from exc
-
-    try:
-        wav_path = temp_dir / "audio.wav"
-        _write_pcm_wav(wav_path, audio_data, sample_rate, channels)
-        fallback_args = build_audio_mux_args(
-            ffmpeg_path,
-            video_path,
-            output_path,
-            sample_rate,
-            channels,
-            audio_pass,
-            disable_cpu_flags=True,
-            audio_input_path=wav_path,
-        )
-        fallback_returncode, fallback_stderr = _run_mux(
-            fallback_args,
-            None,
-            env,
-            _remaining_timeout(deadline),
         )
     except AudioMuxError:
         output_path.unlink(missing_ok=True)
         raise
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
 
     if fallback_returncode != 0:
         output_path.unlink(missing_ok=True)
