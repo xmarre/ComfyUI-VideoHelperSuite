@@ -20,6 +20,7 @@ DEFAULT_WSL_FINALIZE_TIMEOUT = 120.0
 class AudioMuxResult:
     stderr: str
     used_scalar_fallback: bool
+    used_codec_fallback: bool = False
 
 
 class AudioMuxError(RuntimeError):
@@ -49,6 +50,32 @@ def configured_finalize_timeout():
     return timeout
 
 
+def _validate_output_duration(value):
+    if value is None:
+        return None
+    try:
+        duration = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise AudioMuxError("audio mux output duration must be positive") from exc
+    if not math.isfinite(duration) or duration <= 0:
+        raise AudioMuxError("audio mux output duration must be positive")
+    return duration
+
+
+def _replace_audio_codec(audio_pass, codec):
+    args = list(audio_pass)
+    for option in ("-c:a", "-codec:a", "-acodec"):
+        try:
+            index = args.index(option)
+        except ValueError:
+            continue
+        if index + 1 >= len(args):
+            raise AudioMuxError(f"{option} is missing its codec value")
+        args[index + 1] = codec
+        return args
+    return ["-c:a", codec, *args]
+
+
 def build_audio_mux_args(
     ffmpeg_path,
     video_path,
@@ -59,7 +86,9 @@ def build_audio_mux_args(
     *,
     disable_cpu_flags=False,
     audio_input_path=None,
+    output_duration=None,
 ):
+    output_duration = _validate_output_duration(output_duration)
     args = [ffmpeg_path, "-nostdin", "-v", "error", "-y"]
     if disable_cpu_flags:
         args += ["-cpuflags", "0"]
@@ -86,7 +115,12 @@ def build_audio_mux_args(
         "copy",
     ]
     args += list(audio_pass)
-    args += ["-threads:a", "1", "-shortest", str(output_path)]
+    args += ["-threads:a", "1"]
+    if output_duration is None:
+        args += ["-shortest"]
+    else:
+        args += ["-t", f"{output_duration:.9f}"]
+    args += [str(output_path)]
     return args
 
 
@@ -148,6 +182,7 @@ def _run_seekable_scalar_mux(
     audio_data,
     env,
     deadline,
+    output_duration=None,
 ):
     try:
         temp_dir = Path(
@@ -174,6 +209,7 @@ def _run_seekable_scalar_mux(
             audio_pass,
             disable_cpu_flags=True,
             audio_input_path=wav_path,
+            output_duration=output_duration,
         )
         returncode, stderr = _run_mux(
             args,
@@ -195,17 +231,18 @@ def mux_audio_with_sigfpe_fallback(
     audio_pass,
     audio_data,
     env,
+    output_duration=None,
 ):
     output_path = Path(output_path)
     output_path.unlink(missing_ok=True)
+    output_duration = _validate_output_duration(output_duration)
 
     timeout = configured_finalize_timeout()
     deadline = time.monotonic() + timeout if timeout is not None else None
 
-    # On WSL, avoid both parts of the mux topology already implicated in hard
-    # failures: raw non-seekable PCM stdin and FFmpeg's normal CPU SIMD path.
-    # Use the seekable WAV + scalar path from the first attempt instead of
-    # waiting for a SIGFPE that may never return control to Python.
+    # WSL has now produced SIGFPE with raw PCM, seekable WAV, normal CPU flags,
+    # and -cpuflags 0. Keep the safer seekable/scalar topology, but when the
+    # video duration is known avoid FFmpeg's -shortest scheduler entirely.
     if _is_wsl():
         try:
             returncode, stderr, args = _run_seekable_scalar_mux(
@@ -218,18 +255,68 @@ def mux_audio_with_sigfpe_fallback(
                 audio_data,
                 env,
                 deadline,
+                output_duration=output_duration,
             )
         except AudioMuxError:
             output_path.unlink(missing_ok=True)
             raise
-        if returncode != 0:
+        if returncode == 0:
+            return AudioMuxResult(
+                stderr=stderr,
+                used_scalar_fallback=False,
+                used_codec_fallback=False,
+            )
+
+        if returncode != -signal.SIGFPE:
             output_path.unlink(missing_ok=True)
             raise AudioMuxError(
                 f"ffmpeg exited with status {returncode} while muxing audio "
                 "on the WSL seekable scalar path.\n"
                 f"Command: {shlex.join(args)}\n{stderr}"
             )
-        return AudioMuxResult(stderr=stderr, used_scalar_fallback=False)
+
+        # The observed WSL failure survives a seekable WAV and -cpuflags 0.
+        # Remove the native AAC encoder from the second attempt as well. ALAC
+        # is valid in MP4 and gives us a genuinely independent codec path while
+        # preserving the already encoded video stream with -c:v copy.
+        output_path.unlink(missing_ok=True)
+        alac_pass = _replace_audio_codec(audio_pass, "alac")
+        try:
+            fallback_returncode, fallback_stderr, fallback_args = (
+                _run_seekable_scalar_mux(
+                    ffmpeg_path,
+                    video_path,
+                    output_path,
+                    sample_rate,
+                    channels,
+                    alac_pass,
+                    audio_data,
+                    env,
+                    deadline,
+                    output_duration=output_duration,
+                )
+            )
+        except AudioMuxError:
+            output_path.unlink(missing_ok=True)
+            raise
+
+        if fallback_returncode != 0:
+            output_path.unlink(missing_ok=True)
+            raise AudioMuxError(
+                "ffmpeg received SIGFPE on the WSL seekable scalar mux and "
+                "the ALAC codec fallback also failed with status "
+                f"{fallback_returncode}.\n"
+                f"Primary command: {shlex.join(args)}\n"
+                f"Primary stderr:\n{stderr}\n"
+                f"ALAC fallback command: {shlex.join(fallback_args)}\n"
+                f"ALAC fallback stderr:\n{fallback_stderr}"
+            )
+
+        return AudioMuxResult(
+            stderr=fallback_stderr,
+            used_scalar_fallback=True,
+            used_codec_fallback=True,
+        )
 
     primary_args = build_audio_mux_args(
         ffmpeg_path,
