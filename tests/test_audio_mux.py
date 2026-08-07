@@ -8,7 +8,9 @@ from unittest import mock
 
 from videohelpersuite.audio_mux import (
     AudioMuxError,
+    DEFAULT_WSL_FINALIZE_TIMEOUT,
     build_audio_mux_args,
+    configured_finalize_timeout,
     mux_audio_with_sigfpe_fallback,
 )
 
@@ -41,9 +43,29 @@ class AudioMuxCommandTests(unittest.TestCase):
         )
 
 
+class AudioMuxTimeoutTests(unittest.TestCase):
+    @mock.patch("videohelpersuite.audio_mux._is_wsl", return_value=True)
+    def test_wsl_has_bounded_default_timeout(self, _is_wsl_mock):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                configured_finalize_timeout(),
+                DEFAULT_WSL_FINALIZE_TIMEOUT,
+            )
+
+    @mock.patch("videohelpersuite.audio_mux._is_wsl", return_value=True)
+    def test_explicit_zero_disables_wsl_default_timeout(self, _is_wsl_mock):
+        with mock.patch.dict(
+            os.environ,
+            {"VHS_FFMPEG_FINALIZE_TIMEOUT": "0"},
+            clear=True,
+        ):
+            self.assertIsNone(configured_finalize_timeout())
+
+
 class AudioMuxFallbackTests(unittest.TestCase):
+    @mock.patch("videohelpersuite.audio_mux._is_wsl", return_value=False)
     @mock.patch("videohelpersuite.audio_mux.subprocess.run")
-    def test_sigfpe_retries_without_cpu_flags(self, run_mock):
+    def test_sigfpe_retries_without_cpu_flags(self, run_mock, _is_wsl_mock):
         run_mock.side_effect = [
             subprocess.CompletedProcess([], -signal.SIGFPE, b"", b"primary"),
             subprocess.CompletedProcess([], 0, b"", b"fallback"),
@@ -72,10 +94,62 @@ class AudioMuxFallbackTests(unittest.TestCase):
             "0",
         )
 
+    @mock.patch("videohelpersuite.audio_mux._is_wsl", return_value=True)
+    @mock.patch("videohelpersuite.audio_mux.subprocess.run")
+    def test_wsl_uses_scalar_path_on_first_attempt(self, run_mock, _is_wsl_mock):
+        run_mock.return_value = subprocess.CompletedProcess([], 0, b"", b"")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = mux_audio_with_sigfpe_fallback(
+                ffmpeg_path="/usr/bin/ffmpeg",
+                video_path="video.mp4",
+                output_path=Path(temp_dir) / "output.mp4",
+                sample_rate=32000,
+                channels=2,
+                audio_pass=["-c:a", "aac"],
+                audio_data=b"pcm",
+                env={},
+            )
+
+        self.assertFalse(result.used_scalar_fallback)
+        self.assertEqual(run_mock.call_count, 1)
+        args = run_mock.call_args.args[0]
+        self.assertEqual(args[args.index("-cpuflags") + 1], "0")
+        self.assertEqual(
+            run_mock.call_args.kwargs["timeout"],
+            DEFAULT_WSL_FINALIZE_TIMEOUT,
+        )
+
+    @mock.patch("videohelpersuite.audio_mux._is_wsl", return_value=True)
+    @mock.patch("videohelpersuite.audio_mux.subprocess.run")
+    def test_wsl_scalar_failure_does_not_retry(self, run_mock, _is_wsl_mock):
+        run_mock.return_value = subprocess.CompletedProcess(
+            [], -signal.SIGFPE, b"", b"boom"
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "output.mp4"
+            with self.assertRaisesRegex(AudioMuxError, "scalar path"):
+                mux_audio_with_sigfpe_fallback(
+                    ffmpeg_path="/usr/bin/ffmpeg",
+                    video_path="video.mp4",
+                    output_path=output_path,
+                    sample_rate=32000,
+                    channels=2,
+                    audio_pass=["-c:a", "aac"],
+                    audio_data=b"pcm",
+                    env={},
+                )
+            self.assertFalse(output_path.exists())
+
+        self.assertEqual(run_mock.call_count, 1)
+
+    @mock.patch("videohelpersuite.audio_mux._is_wsl", return_value=False)
     @mock.patch("videohelpersuite.audio_mux.subprocess.run")
     def test_non_sigfpe_failure_does_not_retry_and_removes_partial_output(
         self,
         run_mock,
+        _is_wsl_mock,
     ):
         def fail(args, **kwargs):
             Path(args[-1]).write_bytes(b"partial")
@@ -99,10 +173,12 @@ class AudioMuxFallbackTests(unittest.TestCase):
 
         self.assertEqual(run_mock.call_count, 1)
 
+    @mock.patch("videohelpersuite.audio_mux._is_wsl", return_value=False)
     @mock.patch("videohelpersuite.audio_mux.subprocess.run")
     def test_failing_scalar_fallback_raises_and_removes_partial_output(
         self,
         run_mock,
+        _is_wsl_mock,
     ):
         calls = 0
 
@@ -138,8 +214,9 @@ class AudioMuxFallbackTests(unittest.TestCase):
 
         self.assertEqual(run_mock.call_count, 2)
 
+    @mock.patch("videohelpersuite.audio_mux._is_wsl", return_value=False)
     @mock.patch("videohelpersuite.audio_mux.subprocess.run")
-    def test_timeout_removes_partial_output(self, run_mock):
+    def test_timeout_removes_partial_output(self, run_mock, _is_wsl_mock):
         def time_out(args, **kwargs):
             Path(args[-1]).write_bytes(b"partial")
             raise subprocess.TimeoutExpired(args, kwargs["timeout"])
@@ -165,9 +242,15 @@ class AudioMuxFallbackTests(unittest.TestCase):
                     )
             self.assertFalse(output_path.exists())
 
+    @mock.patch("videohelpersuite.audio_mux._is_wsl", return_value=False)
     @mock.patch("videohelpersuite.audio_mux.time.monotonic")
     @mock.patch("videohelpersuite.audio_mux.subprocess.run")
-    def test_timeout_budget_is_shared_across_retry(self, run_mock, monotonic_mock):
+    def test_timeout_budget_is_shared_across_retry(
+        self,
+        run_mock,
+        monotonic_mock,
+        _is_wsl_mock,
+    ):
         monotonic_mock.side_effect = [100.0, 101.0, 104.0]
         run_mock.side_effect = [
             subprocess.CompletedProcess([], -signal.SIGFPE, b"", b"primary"),
