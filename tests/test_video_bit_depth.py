@@ -30,12 +30,13 @@ def output_pixel_format(video_format):
 class VideoBitDepthTests(unittest.TestCase):
     def test_normalizes_widget_and_manual_values(self):
         self.assertEqual(normalize_video_bit_depth(8), 8)
+        self.assertEqual(normalize_video_bit_depth(8.0), 8)
         self.assertEqual(normalize_video_bit_depth("10"), 10)
         self.assertEqual(normalize_video_bit_depth("10-bit"), 10)
         self.assertEqual(normalize_video_bit_depth("8bit"), 8)
 
     def test_rejects_invalid_depths(self):
-        for value in (None, True, 9, 12, "auto", ""):
+        for value in (None, True, 8.5, 9, 12, "auto", ""):
             with self.subTest(value=value):
                 with self.assertRaisesRegex(ValueError, "8 or 10"):
                     normalize_video_bit_depth(value)
