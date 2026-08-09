@@ -26,6 +26,7 @@ from .utils import ffmpeg_path, get_audio, hash_path, validate_path, requeue_wor
         gifski_path, calculate_file_hash, strip_path, try_download_video, is_url, \
         imageOrLatent, BIGMAX, merge_filter_args, ENCODE_ARGS, floatOrInt, cached, \
         ContainsAll
+from .video_bit_depth import apply_video_bit_depth
 from comfy.utils import ProgressBar
 
 if 'VHS_video_formats' not in folder_paths.folder_names_and_paths:
@@ -127,7 +128,7 @@ def tensor_to_int(tensor, bits):
     tensor = tensor.cpu().numpy() * (2**bits-1) + 0.5
     return np.clip(tensor, 0, (2**bits-1))
 def tensor_to_shorts(tensor):
-    return tensor_to_int(tensor, 16).astype(np.uint16)
+    return tensor_to_int(tensor, 16).astype("<u2")
 def tensor_to_bytes(tensor):
     return tensor_to_int(tensor, 8).astype(np.uint8)
 
@@ -504,6 +505,10 @@ class VideoCombine:
             has_alpha = first_image.shape[-1] == 4
             kwargs["has_alpha"] = has_alpha
             video_format = apply_format_widgets(format_ext, kwargs)
+            video_format = apply_video_bit_depth(
+                video_format,
+                kwargs.get("bit_depth"),
+            )
             dim_alignment = video_format.get("dim_alignment", 2)
             if (first_image.shape[1] % dim_alignment) or (first_image.shape[0] % dim_alignment):
                 #output frames must be padded
@@ -536,9 +541,9 @@ class VideoCombine:
             if video_format.get('input_color_depth', '8bit') == '16bit':
                 images = map(tensor_to_shorts, images)
                 if has_alpha:
-                    i_pix_fmt = 'rgba64'
+                    i_pix_fmt = 'rgba64le'
                 else:
-                    i_pix_fmt = 'rgb48'
+                    i_pix_fmt = 'rgb48le'
             else:
                 images = map(tensor_to_bytes, images)
                 if has_alpha:

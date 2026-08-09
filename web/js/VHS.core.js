@@ -94,6 +94,16 @@ function useKVState(nodeType) {
                     }
                 }
             }
+            if (!("bit_depth" in widgetDict) && "pix_fmt" in widgetDict) {
+                // Built-in lossy video formats used to expose FFmpeg pixel
+                // format names directly. Preserve that choice when restoring
+                // workflows after the format-specific bit_depth migration.
+                if (["yuv420p10le", "p010le"].includes(widgetDict.pix_fmt)) {
+                    widgetDict.bit_depth = 10
+                } else if (widgetDict.pix_fmt === "yuv420p") {
+                    widgetDict.bit_depth = 8
+                }
+            }
             if (widgetDict.videopreview?.params?.force_size) {
                 delete widgetDict.videopreview.params.force_size
             }

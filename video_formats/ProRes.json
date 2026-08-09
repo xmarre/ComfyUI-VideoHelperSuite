@@ -15,6 +15,7 @@
         "-vf", "scale=out_color_matrix=bt709",
         "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"
     ],
+    "input_color_depth": "16bit",
     "fake_trc": "bt709",
     "audio_pass": ["-c:a", "pcm_s16le"],
     "extension": "mov",

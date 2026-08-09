@@ -1,11 +1,13 @@
 {
+    "extra_widgets": [["bit_depth", "INT", {"default": 8, "min": 8, "max": 10, "step": 2, "tooltip": "Bit depth of the encoded video. 10-bit preserves smoother gradients through the full RGB-to-YUV pipeline and requires compatible NVENC hardware. This remains SDR Rec.709 output."}]],
     "main_pass":
     [
         "-n", "-c:v", "av1_nvenc",
-        "-pix_fmt", ["pix_fmt", ["yuv420p", "p010le"]],
+        "-pix_fmt", "yuv420p",
         "-vf", "scale=out_color_matrix=bt709",
         "-color_range", "tv", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"
     ],
+    "bit_depths": {"8": "yuv420p", "10": "p010le"},
     "fake_trc": "bt709",
     "audio_pass": ["-c:a", "aac", "-movflags", "use_metadata_tags"],
     "bitrate": ["bitrate","INT", {"default": 10, "min": 1, "max": 999, "step": 1 }],

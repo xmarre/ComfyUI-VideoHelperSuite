@@ -1,15 +1,16 @@
 {
+    "extra_widgets": [["bit_depth", "INT", {"default": 10, "min": 8, "max": 10, "step": 2, "tooltip": "Bit depth of the encoded video. 10-bit preserves smoother gradients through the full RGB-to-YUV pipeline, but some players and downstream nodes may not support it. This remains SDR Rec.709 output."}]],
     "main_pass":
     [
         "-n", "-c:v", "libsvtav1",
-        "-pix_fmt", ["pix_fmt", ["yuv420p10le", "yuv420p"]],
+        "-pix_fmt", "yuv420p10le",
         "-crf", ["crf","INT", {"default": 23, "min": 0, "max": 100, "step": 1}],
         "-vf", "scale=out_color_matrix=bt709",
         "-color_range", "tv", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"
     ],
+    "bit_depths": {"8": "yuv420p", "10": "yuv420p10le"},
     "fake_trc": "bt709",
     "audio_pass": ["-c:a", "libopus"],
-    "input_color_depth": ["input_color_depth", ["8bit", "16bit"]],
     "save_metadata": ["save_metadata", "BOOLEAN", {"default": true}],
     "extension": "webm",
     "environment": {"SVT_LOG": "1"}
