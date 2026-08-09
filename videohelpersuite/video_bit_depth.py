@@ -16,9 +16,11 @@ def normalize_video_bit_depth(bit_depth):
 
     try:
         normalized = int(value)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError("bit_depth must be 8 or 10") from exc
 
+    if not isinstance(value, str) and value != normalized:
+        raise ValueError("bit_depth must be 8 or 10")
     if normalized not in SUPPORTED_VIDEO_BIT_DEPTHS:
         raise ValueError("bit_depth must be 8 or 10")
     return normalized
