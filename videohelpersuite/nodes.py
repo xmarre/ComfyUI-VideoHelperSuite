@@ -27,6 +27,7 @@ from .utils import ffmpeg_path, get_audio, hash_path, validate_path, requeue_wor
         imageOrLatent, BIGMAX, merge_filter_args, ENCODE_ARGS, floatOrInt, cached, \
         ContainsAll
 from .video_bit_depth import apply_video_bit_depth
+from .video_encode import FFmpegProcessError, scalarize_software_encode_args
 from comfy.utils import ProgressBar
 
 if 'VHS_video_formats' not in folder_paths.folder_names_and_paths:
@@ -178,15 +179,35 @@ def _wait_ffmpeg(proc, stderr_file, context):
         ) from e
     return proc.returncode
 
-def ffmpeg_process(args, video_format, video_metadata, file_path, env):
+def _ffmpeg_process_error(
+    *,
+    context,
+    returncode,
+    command,
+    stderr_file,
+    file_path,
+    metadata_attempt=False,
+):
+    return FFmpegProcessError(
+        context=context,
+        returncode=returncode,
+        command=command,
+        stderr=_read_stderr_file(stderr_file).decode(*ENCODE_ARGS),
+        file_path=file_path,
+        metadata_attempt=metadata_attempt,
+    )
 
-    res = None
+def ffmpeg_process(args, video_format, video_metadata, file_path, env):
     frame_data = yield
     total_frames_output = 0
-    if video_format.get('save_metadata', 'False') != 'False':
+    metadata_attempt = video_format.get('save_metadata', 'False') != 'False'
+    command = list(args)
+    context = "saving video"
+
+    if metadata_attempt:
         os.makedirs(folder_paths.get_temp_directory(), exist_ok=True)
         metadata_path = os.path.join(folder_paths.get_temp_directory(), "metadata.txt")
-        #metadata from file should  escape = ; # \ and newline
+        #metadata from file should escape = ; # \\ and newline
         def escape_ffmpeg_metadata(key, value):
             value = str(value)
             value = value.replace("\\","\\\\")
@@ -206,61 +227,70 @@ def ffmpeg_process(args, video_format, video_metadata, file_path, env):
                 if k not in ["prompt", "workflow"]:
                     f.write(escape_ffmpeg_metadata(k, json.dumps(v)) + "\n")
 
-        m_args = args[:1] + ["-i", metadata_path] + args[1:] + ["-metadata", "creation_time=now", "-movflags", "use_metadata_tags"]
-        with tempfile.TemporaryFile() as stderr_file:
-            with subprocess.Popen(m_args + [file_path], stderr=stderr_file,
-                                  stdout=subprocess.DEVNULL, stdin=subprocess.PIPE,
-                                  env=env) as proc:
-                try:
-                    while frame_data is not None:
-                        proc.stdin.write(frame_data)
-                        #TODO: skip flush for increased speed
-                        frame_data = yield
-                        total_frames_output+=1
-                    proc.stdin.flush()
-                    _close_proc_stdin(proc)
-                    returncode = _wait_ffmpeg(proc, stderr_file, "saving video with metadata")
-                    res = _read_stderr_file(stderr_file)
-                    if returncode != 0 and res == b'':
-                        res = f"ffmpeg exited with status {returncode}\n".encode()
-                except BrokenPipeError as e:
-                    _close_proc_stdin(proc)
-                    _wait_ffmpeg(proc, stderr_file, "handling a broken ffmpeg metadata pipe")
-                    err = _read_stderr_file(stderr_file)
-                    #Check if output file exists. If it does, the re-execution
-                    #will also fail. This obscures the cause of the error
-                    #and seems to never occur concurrent to the metadata issue
-                    if os.path.exists(file_path):
-                        raise Exception("An error occurred in the ffmpeg subprocess:\n" \
-                                + err.decode(*ENCODE_ARGS))
-                    #Res was not set
-                    print(err.decode(*ENCODE_ARGS), end="", file=sys.stderr)
-                    logger.warn("An error occurred when saving with metadata")
-    if res != b'':
-        with tempfile.TemporaryFile() as stderr_file:
-            with subprocess.Popen(args + [file_path], stderr=stderr_file,
-                                  stdout=subprocess.DEVNULL, stdin=subprocess.PIPE,
-                                  env=env) as proc:
-                try:
-                    while frame_data is not None:
-                        proc.stdin.write(frame_data)
-                        frame_data = yield
-                        total_frames_output+=1
-                    proc.stdin.flush()
-                    _close_proc_stdin(proc)
-                    returncode = _wait_ffmpeg(proc, stderr_file, "saving video")
-                    res = _read_stderr_file(stderr_file)
-                    if returncode != 0:
-                        raise Exception(f"ffmpeg exited with status {returncode}:\n" \
-                                + res.decode(*ENCODE_ARGS))
-                except BrokenPipeError as e:
-                    _close_proc_stdin(proc)
-                    _wait_ffmpeg(proc, stderr_file, "handling a broken ffmpeg pipe")
-                    res = _read_stderr_file(stderr_file)
-                    raise Exception("An error occurred in the ffmpeg subprocess:\n" \
-                            + res.decode(*ENCODE_ARGS))
+        # Keep global ffmpeg options before every input. The rawvideo-specific
+        # options start at -f rawvideo and must continue to apply to stdin.
+        raw_format_index = next(
+            (
+                index
+                for index, value in enumerate(command[:-1])
+                if value == "-f" and command[index + 1] == "rawvideo"
+            ),
+            1,
+        )
+        command = (
+            command[:raw_format_index]
+            + ["-i", metadata_path]
+            + command[raw_format_index:]
+            + ["-metadata", "creation_time=now", "-movflags", "use_metadata_tags"]
+        )
+        context = "saving video with metadata"
+
+    command.append(file_path)
+    with tempfile.TemporaryFile() as stderr_file:
+        with subprocess.Popen(
+            command,
+            stderr=stderr_file,
+            stdout=subprocess.DEVNULL,
+            stdin=subprocess.PIPE,
+            env=env,
+        ) as proc:
+            try:
+                while frame_data is not None:
+                    proc.stdin.write(frame_data)
+                    total_frames_output += 1
+                    frame_data = yield
+                proc.stdin.flush()
+                _close_proc_stdin(proc)
+                returncode = _wait_ffmpeg(proc, stderr_file, context)
+            except BrokenPipeError as e:
+                _close_proc_stdin(proc)
+                returncode = _wait_ffmpeg(
+                    proc,
+                    stderr_file,
+                    f"handling a broken ffmpeg pipe while {context}",
+                )
+                raise _ffmpeg_process_error(
+                    context=context,
+                    returncode=returncode,
+                    command=command,
+                    stderr_file=stderr_file,
+                    file_path=file_path,
+                    metadata_attempt=metadata_attempt,
+                ) from e
+
+        if returncode != 0:
+            raise _ffmpeg_process_error(
+                context=context,
+                returncode=returncode,
+                command=command,
+                stderr_file=stderr_file,
+                file_path=file_path,
+                metadata_attempt=metadata_attempt,
+            )
+        res = _read_stderr_file(stderr_file)
+
     yield total_frames_output
-    if len(res) > 0:
+    if res:
         print(res.decode(*ENCODE_ARGS), end="", file=sys.stderr)
 
 def gifski_process(args, dimensions, frame_rate, video_format, file_path, env):
@@ -360,6 +390,9 @@ class VideoCombine:
         vae=None,
         **kwargs
     ):
+        scalar_software_encode = bool(
+            kwargs.pop("_vhs_scalar_software_encode", False)
+        )
         if latents is not None:
             images = latents
         if images is None:
@@ -606,6 +639,8 @@ class VideoCombine:
                 else:
                     args += video_format['main_pass'] + bitrate_arg
                     merge_filter_args(args)
+                    if scalar_software_encode:
+                        args = scalarize_software_encode_args(args)
                     output_process = ffmpeg_process(args, video_format, video_metadata, file_path, env)
                 #Proceed to first yield
                 output_process.send(None)
@@ -1183,7 +1218,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VHS_GetLatentCount": "Get Latent Count 🎥🅥🅗🅢",
     "VHS_GetImageCount": "Get Image Count 🎥🅥🅗🅢",
     "VHS_GetMaskCount": "Get Mask Count 🎥🅥🅗🅢",
-    "VHS_DuplicateLatents": "Repeat Latents 🎥🅥🅗🅢",
+    "VHS_DuplicateLatents": "Repeat Latents 🎥🅥🅗🅧",
     "VHS_DuplicateImages": "Repeat Images 🎥🅥🅗🅢",
     "VHS_DuplicateMasks": "Repeat Masks 🎥🅥🅗🅢",
     "VHS_SelectEveryNthLatent": "Select Every Nth Latent 🎥🅥🅗🅢",
