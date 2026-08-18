@@ -88,6 +88,16 @@ def _set_or_append_option(args, option_names, append_name, value):
     args.extend([append_name, str(value)])
 
 
+def _set_or_insert_global_option(args, option_name, value):
+    for index, option in enumerate(args[:-1]):
+        if option == option_name:
+            args[index + 1] = str(value)
+            return
+    # Global ffmpeg options belong before the first input/output option. Keep
+    # argv[0] as the executable and place them immediately after it.
+    args[1:1] = [option_name, str(value)]
+
+
 def _merge_codec_params(args, option_name, replacements):
     option_index = None
     for index, option in enumerate(args[:-1]):
@@ -123,13 +133,8 @@ def scalarize_software_encode_args(args):
             f"no scalar software fallback is defined for video encoder {encoder!r}"
         )
 
-    _set_or_append_option(scalar_args, {"-cpuflags"}, "-cpuflags", "0")
-    _set_or_append_option(
-        scalar_args,
-        {"-filter_threads"},
-        "-filter_threads",
-        "1",
-    )
+    _set_or_insert_global_option(scalar_args, "-cpuflags", "0")
+    _set_or_insert_global_option(scalar_args, "-filter_threads", "1")
     _set_or_append_option(
         scalar_args,
         {"-threads", "-threads:v", "-threads:0"},
