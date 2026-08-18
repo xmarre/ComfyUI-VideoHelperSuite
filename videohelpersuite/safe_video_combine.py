@@ -155,6 +155,16 @@ class SafeVideoCombine(VideoCombine):
             attempt_kwargs = dict(base_video_kwargs)
             if extra_kwargs:
                 attempt_kwargs.update(extra_kwargs)
+
+            attempt_manual_widgets = manual_format_widgets
+            if (
+                manual_format_widgets is not None
+                and extra_kwargs
+                and "save_metadata" in extra_kwargs
+            ):
+                attempt_manual_widgets = dict(manual_format_widgets)
+                attempt_manual_widgets["save_metadata"] = extra_kwargs["save_metadata"]
+
             return VideoCombine.combine_video(
                 self,
                 frame_rate=frame_rate,
@@ -169,7 +179,7 @@ class SafeVideoCombine(VideoCombine):
                 extra_pnginfo=extra_pnginfo,
                 audio=None,
                 unique_id=unique_id,
-                manual_format_widgets=manual_format_widgets,
+                manual_format_widgets=attempt_manual_widgets,
                 meta_batch=meta_batch,
                 vae=vae,
                 **attempt_kwargs,
@@ -209,8 +219,11 @@ class SafeVideoCombine(VideoCombine):
 
                 metadata_retry = (
                     error.metadata_attempt
-                    and not attempt_options.get("save_metadata") is False
-                    and not error.is_sigfpe
+                    and attempt_options.get("save_metadata") is not False
+                    and (
+                        not error.is_sigfpe
+                        or attempt_options.get("_vhs_scalar_software_encode", False)
+                    )
                 )
                 if metadata_retry:
                     _cleanup_failed_encode_attempt(error)
