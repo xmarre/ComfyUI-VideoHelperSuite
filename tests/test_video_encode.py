@@ -70,7 +70,7 @@ class VideoEncodeRecoveryTests(unittest.TestCase):
         self.assertEqual(recovered[recovered.index("-threads") + 1], "1")
         self.assertEqual(
             recovered[recovered.index("-x265-params") + 1],
-            "log-level=quiet:asm=0:frame-threads=1",
+            "log-level=quiet:asm=0:pools=none:frame-threads=1",
         )
         self.assertEqual(recovered[recovered.index("-crf") + 1], "22")
 
