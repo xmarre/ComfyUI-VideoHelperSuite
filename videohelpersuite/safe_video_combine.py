@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .audio_mux import (
     AudioMuxError,
+    _is_wsl,
     configured_finalize_timeout,
     mux_audio_with_sigfpe_fallback,
 )
@@ -13,6 +14,7 @@ from .audio_utils import validate_sample_rate, waveform_to_pcm_s16le
 from .logger import logger
 from .nodes import VideoCombine, apply_format_widgets
 from .utils import ffmpeg_path
+from .video_encode import FFmpegProcessError, supports_scalar_software_fallback
 
 
 DEFAULT_FFPROBE_TIMEOUT = 30.0
@@ -84,8 +86,24 @@ def _format_options(format_name, manual_format_widgets, kwargs):
     return apply_format_widgets(format_name, format_kwargs)
 
 
+def _cleanup_failed_encode_attempt(error):
+    if not error.file_path:
+        return
+    video_path = Path(error.file_path)
+    video_path.unlink(missing_ok=True)
+    video_path.with_suffix(".png").unlink(missing_ok=True)
+
+
+def _raise_recovery_failure(primary_error, recovery_error):
+    raise RuntimeError(
+        f"{recovery_error}\n\n"
+        "Primary ffmpeg failure before the recovery attempt:\n"
+        f"{primary_error}"
+    ) from recovery_error
+
+
 class SafeVideoCombine(VideoCombine):
-    """Video Combine variant with a hardened, recoverable audio mux path."""
+    """Video Combine variant with recoverable video encoding and audio muxing."""
 
     def combine_video(
         self,
@@ -106,7 +124,7 @@ class SafeVideoCombine(VideoCombine):
         vae=None,
         **kwargs,
     ):
-        if audio is None or not format.startswith("video/"):
+        if not format.startswith("video/"):
             return super().combine_video(
                 frame_rate=frame_rate,
                 loop_count=loop_count,
@@ -126,31 +144,90 @@ class SafeVideoCombine(VideoCombine):
                 **kwargs,
             )
 
-        audio = _validate_audio_input(audio)
+        if audio is not None:
+            audio = _validate_audio_input(audio)
+
         format_name = format.split("/", 1)[1]
         video_format = _format_options(format_name, manual_format_widgets, kwargs)
+        base_video_kwargs = dict(kwargs)
 
-        # Let the established VideoCombine implementation create the video,
-        # but deliberately bypass its raw-f32/apad audio subprocess. The
-        # hardened mux below uses deterministic PCM16 and can retry SIGFPE.
-        result = super().combine_video(
-            frame_rate=frame_rate,
-            loop_count=loop_count,
-            images=images,
-            latents=latents,
-            filename_prefix=filename_prefix,
-            format=format,
-            pingpong=pingpong,
-            save_output=save_output,
-            prompt=prompt,
-            extra_pnginfo=extra_pnginfo,
-            audio=None,
-            unique_id=unique_id,
-            manual_format_widgets=manual_format_widgets,
-            meta_batch=meta_batch,
-            vae=vae,
-            **kwargs,
-        )
+        def run_video_only(extra_kwargs=None):
+            attempt_kwargs = dict(base_video_kwargs)
+            if extra_kwargs:
+                attempt_kwargs.update(extra_kwargs)
+            return VideoCombine.combine_video(
+                self,
+                frame_rate=frame_rate,
+                loop_count=loop_count,
+                images=images,
+                latents=latents,
+                filename_prefix=filename_prefix,
+                format=format,
+                pingpong=pingpong,
+                save_output=save_output,
+                prompt=prompt,
+                extra_pnginfo=extra_pnginfo,
+                audio=None,
+                unique_id=unique_id,
+                manual_format_widgets=manual_format_widgets,
+                meta_batch=meta_batch,
+                vae=vae,
+                **attempt_kwargs,
+            )
+
+        attempt_options = {}
+        primary_error = None
+        while True:
+            try:
+                result = run_video_only(attempt_options)
+                break
+            except FFmpegProcessError as error:
+                if primary_error is None:
+                    primary_error = error
+
+                # Meta-batches retain an ffmpeg generator across executions.
+                # Replaying one failed batch would corrupt that retained state.
+                if meta_batch is not None:
+                    raise
+
+                scalar_retry = (
+                    error.is_sigfpe
+                    and _is_wsl()
+                    and not attempt_options.get("_vhs_scalar_software_encode", False)
+                    and supports_scalar_software_fallback(error.command)
+                )
+                if scalar_retry:
+                    _cleanup_failed_encode_attempt(error)
+                    attempt_options["_vhs_scalar_software_encode"] = True
+                    logger.warn(
+                        "ffmpeg software video encoding received SIGFPE on WSL; "
+                        "retrying the same codec, pixel format, bit depth, and "
+                        "quality settings with FFmpeg and encoder SIMD disabled "
+                        "and a single encoder thread"
+                    )
+                    continue
+
+                metadata_retry = (
+                    error.metadata_attempt
+                    and not attempt_options.get("save_metadata") is False
+                    and not error.is_sigfpe
+                )
+                if metadata_retry:
+                    _cleanup_failed_encode_attempt(error)
+                    attempt_options["save_metadata"] = False
+                    logger.warn(
+                        "ffmpeg rejected the metadata-bearing video encode; "
+                        "retrying the complete frame sequence without embedded "
+                        "video metadata"
+                    )
+                    continue
+
+                if primary_error is error:
+                    raise
+                _raise_recovery_failure(primary_error, error)
+
+        if audio is None:
+            return result
 
         if "gifski_pass" in video_format:
             return result
