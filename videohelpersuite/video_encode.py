@@ -152,7 +152,7 @@ def scalarize_software_encode_args(args):
         _merge_codec_params(
             scalar_args,
             "-x265-params",
-            {"asm": "0", "frame-threads": "1"},
+            {"asm": "0", "pools": "none", "frame-threads": "1"},
         )
 
     return scalar_args
