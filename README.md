@@ -37,7 +37,9 @@ Returns: a `VHS_FILENAMES` which consists of a boolean indicating if save_output
 Depending on the format chosen, additional options may become available, including
 - crf: Describes the quality of the output video. A lower number gives a higher quality video and a larger file size, while a higher number gives a lower quality video with a smaller size. Scaling varies by codec, but visually lossless output generally occurs around 20.
 - save_metadata: Includes a copy of the workflow in the output video which can be loaded by dragging and dropping the video, just like with images.
-- pix_fmt: Changes how the pixel data is stored. `yuv420p10le` has higher color quality, but won't work on all devices
+- bit_depth: Selects 8-bit or 10-bit encoding for supported formats. The 10-bit path sends 16-bit RGB frames to FFmpeg so gradients are not first quantized to 8-bit. Ten-bit video can reduce banding, but is less widely compatible.
+
+The bit-depth setting controls precision, not dynamic range. Video Combine treats ComfyUI image tensors as SDR and writes Rec.709 output. Selecting 10-bit does not create HDR, and the node does not attach HDR metadata to sources that do not provide a defined HDR color space, transfer function, or mastering information.
 ### Load Audio
 Provides a way to load standalone audio files.
 - seek_seconds: An optional start time for the audio file in seconds.
@@ -102,7 +104,9 @@ Most configuration takes place in `main_pass`, which is a list of arguments that
 
 `extension` designates both the file extension and the container format that is used. If some of the above options are omitted from `main_pass` it can affect what default options are chosen.  
 `environment` can optionally be provided to set environment variables during execution. For av1 it's used to reduce the verbosity of logging so that only major errors are displayed.  
-`input_color_depth` effects the format in which pixels are passed to the ffmpeg subprocess. Current valid options are `8bit` and `16bit`. The later will produce higher quality output, but is experimental.
+`input_color_depth` affects the format in which pixels are passed to the ffmpeg subprocess. Current valid options are `8bit` and `16bit`. A 10-bit output must use a 16-bit input pipe to preserve more than eight bits of source precision.
+
+Built-in formats that expose `bit_depth` declare a `bit_depths` mapping from `8` and `10` to their codec-specific FFmpeg pixel formats. Video Combine applies the selected output pixel format and matching input pipe depth together. Custom formats can continue to specify a fixed `-pix_fmt` and `input_color_depth` directly.
 
 Fields can be exposed in the webui as a widget using a format similar to what is used in the creation of custom nodes. In the above example, the argument for `-crf` will be exposed as a format widget in the webui. Format widgets are a list of up to 3 terms
 - The name of the widget that will be displayed in the web ui
