@@ -1216,7 +1216,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VHS_MergeImages": "Merge Images 🎥🅥🅗🅢",
     "VHS_MergeMasks": "Merge Masks 🎥🅥🅗🅢",
     "VHS_GetLatentCount": "Get Latent Count 🎥🅥🅗🅢",
-    "VHS_GetImageCount": "Get Image Count 🎥🅥🅗🅗🅢",
+    "VHS_GetImageCount": "Get Image Count 🎥🅥🅗🅢",
     "VHS_GetMaskCount": "Get Mask Count 🎥🅥🅗🅢",
     "VHS_DuplicateLatents": "Repeat Latents 🎥🅥🅗🅢",
     "VHS_DuplicateImages": "Repeat Images 🎥🅥🅗🅢",
