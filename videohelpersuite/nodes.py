@@ -768,8 +768,7 @@ class LoadAudio:
             raise Exception("audio_file is not a valid path: " + audio_file)
         if is_url(audio_file):
             audio_file = try_download_video(audio_file) or audio_file
-        #Eagerly fetch the audio since the user must be using it if the
-        #node executes, unlike Load Video
+        #Eagerly fetch the audio since the user must be using it if it executes, unlike Load Video
         audio = get_audio(audio_file, start_time=seek_seconds, duration=duration)
         loaded_duration = audio['waveform'].size(2)/audio['sample_rate']
         return (audio, loaded_duration)
@@ -818,7 +817,7 @@ class LoadAudioUpload:
     @classmethod
     def IS_CHANGED(s, audio, **kwargs):
         audio_file = folder_paths.get_annotated_filepath(strip_path(audio))
-        return hash_path(audio_file)
+        return calculate_file_hash(audio_file)
 
     @classmethod
     def VALIDATE_INPUTS(s, audio, **kwargs):
@@ -1218,7 +1217,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VHS_GetLatentCount": "Get Latent Count 🎥🅥🅗🅢",
     "VHS_GetImageCount": "Get Image Count 🎥🅥🅗🅢",
     "VHS_GetMaskCount": "Get Mask Count 🎥🅥🅗🅢",
-    "VHS_DuplicateLatents": "Repeat Latents 🎥🅥🅗🅧",
+    "VHS_DuplicateLatents": "Repeat Latents 🎥🅥🅗🅢",
     "VHS_DuplicateImages": "Repeat Images 🎥🅥🅗🅢",
     "VHS_DuplicateMasks": "Repeat Masks 🎥🅥🅗🅢",
     "VHS_SelectEveryNthLatent": "Select Every Nth Latent 🎥🅥🅗🅢",
