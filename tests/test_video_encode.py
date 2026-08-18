@@ -43,6 +43,8 @@ class VideoEncodeRecoveryTests(unittest.TestCase):
         self.assertEqual(recovered[recovered.index("-crf") + 1], "19")
         self.assertEqual(recovered[recovered.index("-cpuflags") + 1], "0")
         self.assertEqual(recovered[recovered.index("-filter_threads") + 1], "1")
+        self.assertLess(recovered.index("-cpuflags"), recovered.index("-i"))
+        self.assertLess(recovered.index("-filter_threads"), recovered.index("-i"))
         self.assertEqual(recovered[recovered.index("-threads:v") + 1], "1")
         self.assertEqual(
             recovered[recovered.index("-x264-params") + 1],
